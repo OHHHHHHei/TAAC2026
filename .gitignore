@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# Local data and generated artifacts
+*.parquet
+checkpoints/
+ckpt/
+logs/
+runs/
+tf_events/
+events.out.tfevents*
+
+# Platform / editor noise
+.DS_Store
+.idea/
+.vscode/
