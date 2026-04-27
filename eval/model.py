@@ -1225,6 +1225,7 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        use_ns_output_fusion: bool = False,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1243,6 +1244,7 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+        self.use_ns_output_fusion = use_ns_output_fusion
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1417,6 +1419,14 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
+        if self.use_ns_output_fusion:
+            self.ns_output_norm = nn.LayerNorm(d_model)
+            self.output_fusion = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+            )
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -1588,7 +1598,7 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list: list,
         seq_masks_list: list,
         apply_dropout: bool = True
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs the multi-sequence block stack with dropout and output projection."""
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
@@ -1629,7 +1639,19 @@ class PCVRHyFormer(nn.Module):
         output = all_q.view(B, -1)  # (B, Nq*S*D)
         output = self.output_proj(output)  # (B, D)
 
-        return output
+        return output, curr_ns
+
+    def _fuse_output_with_ns(
+        self,
+        q_output: torch.Tensor,
+        ns_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Optionally fuses final NS-token context into the classifier input."""
+        if not self.use_ns_output_fusion:
+            return q_output
+
+        ns_output = self.ns_output_norm(ns_tokens.mean(dim=1))
+        return self.output_fusion(torch.cat([q_output, ns_output], dim=-1))
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
@@ -1665,10 +1687,11 @@ class PCVRHyFormer(nn.Module):
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
+        q_output, final_ns = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
+        output = self._fuse_output_with_ns(q_output, final_ns)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1705,10 +1728,11 @@ class PCVRHyFormer(nn.Module):
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        output = self._run_multi_seq_blocks(
+        q_output, final_ns = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+        output = self._fuse_output_with_ns(q_output, final_ns)
 
         logits = self.clsfier(output)
         return logits, output

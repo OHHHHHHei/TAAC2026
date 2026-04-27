@@ -173,6 +173,9 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
+    parser.add_argument('--use_ns_output_fusion', action='store_true', default=False,
+                        help='Fuse pooled final NS tokens with sequence-query output '
+                             'before the classifier.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -298,6 +301,7 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
+        "use_ns_output_fusion": args.use_ns_output_fusion,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,

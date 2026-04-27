@@ -65,6 +65,7 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
+    'use_ns_output_fusion': False,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
