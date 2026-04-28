@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -52,6 +53,8 @@ class PCVRHyFormerRankingTrainer:
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
         reinit_cardinality_threshold: int = 0,
+        amp: bool = False,
+        amp_dtype: str = 'bf16',
         ckpt_params: Optional[Dict[str, Any]] = None,
         writer: Optional[Any] = None,
         schema_path: Optional[str] = None,
@@ -104,13 +107,36 @@ class PCVRHyFormerRankingTrainer:
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
         self.sparse_weight_decay: float = sparse_weight_decay
+        self.amp_enabled: bool = bool(
+            amp and str(device).startswith('cuda') and torch.cuda.is_available())
+        self.amp_dtype_name: str = amp_dtype.lower()
+        if self.amp_dtype_name not in ('bf16', 'fp16'):
+            raise ValueError(f"Unsupported amp_dtype={amp_dtype!r}")
+        if self.amp_enabled and self.amp_dtype_name == 'bf16':
+            bf16_supported = getattr(torch.cuda, 'is_bf16_supported', lambda: True)()
+            if not bf16_supported:
+                logging.warning(
+                    "AMP dtype bf16 requested but CUDA device does not report "
+                    "bf16 support; falling back to fp16")
+                self.amp_dtype_name = 'fp16'
+        self.amp_dtype = (
+            torch.bfloat16 if self.amp_dtype_name == 'bf16' else torch.float16)
+        scaler_enabled = self.amp_enabled and self.amp_dtype_name == 'fp16'
+        try:
+            self.grad_scaler = torch.amp.GradScaler(
+                'cuda', enabled=scaler_enabled)
+        except (AttributeError, TypeError):
+            self.grad_scaler = torch.cuda.amp.GradScaler(
+                enabled=scaler_enabled)
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"amp_enabled={self.amp_enabled}, "
+                     f"amp_dtype={self.amp_dtype_name}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -214,6 +240,12 @@ class PCVRHyFormerRankingTrainer:
             else:
                 device_batch[k] = v
         return device_batch
+
+    def _autocast_context(self):
+        """Return the CUDA autocast context used for mixed precision training."""
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
 
     def _handle_validation_result(
         self,
@@ -414,21 +446,35 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with self._autocast_context():
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.unscale_(self.sparse_optimizer)
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
+            loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.step(self.sparse_optimizer)
+            self.grad_scaler.update()
+        else:
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 

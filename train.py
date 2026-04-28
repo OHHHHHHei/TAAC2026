@@ -67,6 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='Enable CUDA automatic mixed precision training')
+    parser.add_argument('--amp_dtype', type=str, default='bf16',
+                        choices=['bf16', 'fp16'],
+                        help='AMP compute dtype when --amp is enabled')
+    parser.add_argument('--tf32', action='store_true', default=False,
+                        help='Enable TF32 matmul/cuDNN kernels on supported NVIDIA GPUs')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -230,6 +237,15 @@ def main() -> None:
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
 
+    if args.tf32 and args.device.startswith('cuda'):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+        logging.info("TF32 enabled for CUDA matmul/cuDNN where supported")
+
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(args.tf_events_dir)
 
@@ -360,6 +376,8 @@ def main() -> None:
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
         reinit_cardinality_threshold=args.reinit_cardinality_threshold,
+        amp=args.amp,
+        amp_dtype=args.amp_dtype,
         ckpt_params=ckpt_params,
         writer=writer,
         schema_path=schema_path,

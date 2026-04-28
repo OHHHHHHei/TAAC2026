@@ -14,6 +14,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --split_mode time \
     --split_time_col timestamp \
     --split_time_stat median \
+    --amp \
+    --amp_dtype bf16 \
+    --tf32 \
     --num_workers 8 \
     "$@"
 
