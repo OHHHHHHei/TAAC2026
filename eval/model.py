@@ -688,27 +688,23 @@ class LongerEncoder(nn.Module):
         # Valid lengths per sample
         valid_len = (~key_padding_mask).sum(dim=1)  # (B,)
 
-        # Start position for each sample: max(valid_len - top_k, 0)
         actual_k = torch.clamp(valid_len, max=self.top_k)  # (B,)
-        start_pos = valid_len - actual_k  # (B,)
+        pad_count = self.top_k - actual_k  # (B,)
 
-        # Build gather indices: (B, top_k)
-        offsets = torch.arange(self.top_k, device=device).unsqueeze(0).expand(B, -1)  # (B, top_k)
-        indices = start_pos.unsqueeze(1) + offsets  # (B, top_k)
-
-        # For samples with valid_len < top_k, early indices may exceed valid range;
-        # clamp to [0, L-1] and handle via mask below
-        indices = torch.clamp(indices, min=0, max=L - 1)
+        # Valid sequence events are padded at the tail in the dataset, and the
+        # list head contains the most recent actions. Keep the first actual_k
+        # valid events and right-align them into top_k slots so padding stays
+        # on the left for subsequent self-attention layers.
+        output_pos = torch.arange(self.top_k, device=device).unsqueeze(0).expand(B, -1)  # (B, top_k)
+        source_pos = output_pos - pad_count.unsqueeze(1)  # (B, top_k)
+        indices = torch.clamp(source_pos, min=0, max=L - 1)
 
         # Gather: (B, top_k, D)
         indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)  # (B, top_k, D)
         top_k_tokens = torch.gather(x, dim=1, index=indices_expanded)
 
         # New padding mask: first (top_k - actual_k) positions are padding
-        new_valid_len = actual_k  # (B,)
-        pad_count = self.top_k - new_valid_len  # (B,)
-        pos_indices = torch.arange(self.top_k, device=device).unsqueeze(0)  # (1, top_k)
-        new_padding_mask = pos_indices < pad_count.unsqueeze(1)  # (B, top_k)
+        new_padding_mask = output_pos < pad_count.unsqueeze(1)  # (B, top_k)
 
         # Zero out tokens at padding positions
         top_k_tokens = top_k_tokens * (~new_padding_mask).unsqueeze(-1).float()
