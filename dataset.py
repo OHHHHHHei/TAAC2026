@@ -16,6 +16,7 @@ import logging
 import random
 import json
 import gc
+import glob as _glob
 
 import numpy as np
 import pyarrow as pa
@@ -106,6 +107,62 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+
+def _collect_row_groups(data_dir: str) -> List[Tuple[str, int, int]]:
+    """Collect ``(file_path, row_group_index, num_rows)`` in file order."""
+    pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
+    rg_info: List[Tuple[str, int, int]] = []
+    for f in pq_files:
+        pf = pq.ParquetFile(f)
+        for i in range(pf.metadata.num_row_groups):
+            rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
+    return rg_info
+
+
+def _row_group_time_value(
+    file_path: str,
+    row_group_idx: int,
+    time_col: str,
+    stat: str,
+) -> float:
+    """Read one time column from a Row Group and return its summary value."""
+    pf = pq.ParquetFile(file_path)
+    table = pf.read_row_group(row_group_idx, columns=[time_col])
+    values = table.column(time_col).to_numpy(zero_copy_only=False)
+    values = values[~np.isnan(values)] if np.issubdtype(values.dtype, np.floating) else values
+    if len(values) == 0:
+        return 0.0
+
+    if stat == 'median':
+        return float(np.median(values))
+    if stat == 'mean':
+        return float(np.mean(values))
+    if stat == 'min':
+        return float(np.min(values))
+    if stat == 'max':
+        return float(np.max(values))
+    raise ValueError(f"Unknown split_time_stat={stat!r}")
+
+
+def _order_row_groups(
+    rg_info: List[Tuple[str, int, int]],
+    split_mode: str,
+    split_time_col: str,
+    split_time_stat: str,
+) -> List[Tuple[str, int, int]]:
+    """Return Row Groups ordered for train/valid splitting."""
+    if split_mode == 'row_group':
+        return rg_info
+    if split_mode != 'time':
+        raise ValueError(f"Unknown split_mode={split_mode!r}")
+
+    timed = []
+    for pos, (f, rg_idx, n_rows) in enumerate(rg_info):
+        t = _row_group_time_value(f, rg_idx, split_time_col, split_time_stat)
+        timed.append((t, pos, f, rg_idx, n_rows))
+    timed.sort(key=lambda x: (x[0], x[1]))
+    return [(f, rg_idx, n_rows) for _, _, f, rg_idx, n_rows in timed]
+
 # Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
 BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
@@ -151,6 +208,7 @@ class PCVRParquetDataset(IterableDataset):
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
+        row_group_list: Optional[List[Tuple[str, int, int]]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
     ) -> None:
@@ -167,6 +225,8 @@ class PCVRParquetDataset(IterableDataset):
             buffer_batches: shuffle buffer size in units of batches.
             row_group_range: ``(start, end)`` slice of Row Groups; ``None`` to
                 use all Row Groups.
+            row_group_list: explicit Row Groups to read. When provided, this
+                takes precedence over ``row_group_range``.
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
@@ -193,15 +253,18 @@ class PCVRParquetDataset(IterableDataset):
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
 
         # Build the list of Row Groups.
-        self._rg_list = []
-        for f in self._parquet_files:
-            pf = pq.ParquetFile(f)
-            for i in range(pf.metadata.num_row_groups):
-                self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
+        if row_group_list is not None:
+            self._rg_list = list(row_group_list)
+        else:
+            self._rg_list = []
+            for f in self._parquet_files:
+                pf = pq.ParquetFile(f)
+                for i in range(pf.metadata.num_row_groups):
+                    self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
 
-        if row_group_range is not None:
-            start, end = row_group_range
-            self._rg_list = self._rg_list[start:end]
+            if row_group_range is not None:
+                start, end = row_group_range
+                self._rg_list = self._rg_list[start:end]
 
         self.num_rows = sum(r[2] for r in self._rg_list)
 
@@ -681,12 +744,17 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    split_mode: str = 'row_group',
+    split_time_col: str = 'timestamp',
+    split_time_stat: str = 'median',
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
     The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    Groups. ``split_mode='row_group'`` keeps the source file order, while
+    ``split_mode='time'`` first sorts Row Groups by a per-Row-Group time
+    statistic and therefore uses later Row Groups for validation.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -696,14 +764,13 @@ def get_pcvr_data(
     """
     random.seed(seed)
 
-    import glob as _glob
-    pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
-
-    rg_info = []
-    for f in pq_files:
-        pf = pq.ParquetFile(f)
-        for i in range(pf.metadata.num_row_groups):
-            rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
+    rg_info = _collect_row_groups(data_dir)
+    rg_info = _order_row_groups(
+        rg_info,
+        split_mode=split_mode,
+        split_time_col=split_time_col,
+        split_time_stat=split_time_stat,
+    )
     total_rgs = len(rg_info)
 
     n_valid_rgs = max(1, int(total_rgs * valid_ratio))
@@ -714,11 +781,30 @@ def get_pcvr_data(
         n_train_rgs = max(1, int(n_train_rgs * train_ratio))
         logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+    train_rg_info = rg_info[:n_train_rgs]
+    valid_rg_info = rg_info[n_train_rgs:]
+    train_rows = sum(r[2] for r in train_rg_info)
+    valid_rows = sum(r[2] for r in valid_rg_info)
 
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+    logging.info(f"Row Group split ({split_mode}): {len(train_rg_info)} train "
+                 f"({train_rows} rows), {len(valid_rg_info)} valid ({valid_rows} rows)")
+    if split_mode == 'time':
+        first_train_time = _row_group_time_value(
+            train_rg_info[0][0], train_rg_info[0][1],
+            split_time_col, split_time_stat) if train_rg_info else None
+        last_train_time = _row_group_time_value(
+            train_rg_info[-1][0], train_rg_info[-1][1],
+            split_time_col, split_time_stat) if train_rg_info else None
+        first_valid_time = _row_group_time_value(
+            valid_rg_info[0][0], valid_rg_info[0][1],
+            split_time_col, split_time_stat) if valid_rg_info else None
+        last_valid_time = _row_group_time_value(
+            valid_rg_info[-1][0], valid_rg_info[-1][1],
+            split_time_col, split_time_stat) if valid_rg_info else None
+        logging.info(
+            f"Time split by {split_time_col}/{split_time_stat}: "
+            f"train_time=[{first_train_time}, {last_train_time}], "
+            f"valid_time=[{first_valid_time}, {last_valid_time}]")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,7 +813,7 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_list=train_rg_info,
         clip_vocab=clip_vocab,
     )
 
@@ -749,7 +835,7 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
+        row_group_list=valid_rg_info,
         clip_vocab=clip_vocab,
     )
     valid_loader = DataLoader(

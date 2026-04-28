@@ -11,6 +11,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --use_ns_output_fusion \
+    --split_mode time \
+    --split_time_col timestamp \
+    --split_time_stat median \
     --num_workers 8 \
     "$@"
 

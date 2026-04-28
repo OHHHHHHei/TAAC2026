@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
+    parser.add_argument('--split_mode', type=str, default='row_group',
+                        choices=['row_group', 'time'],
+                        help='Train/valid split mode: source Row Group order or '
+                             'Row Groups sorted by a timestamp summary')
+    parser.add_argument('--split_time_col', type=str, default='timestamp',
+                        help='Time column used when --split_mode=time')
+    parser.add_argument('--split_time_stat', type=str, default='median',
+                        choices=['median', 'mean', 'min', 'max'],
+                        help='Per-Row-Group time statistic used for time split')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -252,6 +261,9 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        split_mode=args.split_mode,
+        split_time_col=args.split_time_col,
+        split_time_stat=args.split_time_stat,
     )
 
     # ---- NS groups ----
