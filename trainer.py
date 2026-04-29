@@ -55,6 +55,7 @@ class PCVRHyFormerRankingTrainer:
         reinit_cardinality_threshold: int = 0,
         amp: bool = False,
         amp_dtype: str = 'bf16',
+        save_epoch_checkpoints: bool = False,
         ckpt_params: Optional[Dict[str, Any]] = None,
         writer: Optional[Any] = None,
         schema_path: Optional[str] = None,
@@ -131,21 +132,33 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.save_epoch_checkpoints: bool = save_epoch_checkpoints
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"amp_enabled={self.amp_enabled}, "
-                     f"amp_dtype={self.amp_dtype_name}")
+                     f"amp_dtype={self.amp_dtype_name}, "
+                     f"save_epoch_checkpoints={self.save_epoch_checkpoints}")
 
-    def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
+    def _build_step_dir_name(
+        self,
+        global_step: int,
+        is_best: bool = False,
+        epoch: Optional[int] = None,
+        tag: Optional[str] = None,
+    ) -> str:
         """Build a checkpoint sub-directory name such as
-        ``global_step2500.layer=2.head=4.hidden=64[.best_model]``.
+        ``global_step2500.layer=2.head=4.hidden=64[.epoch=1.snapshot][.best_model]``.
         """
         parts = [f"global_step{global_step}"]
         for key in ("layer", "head", "hidden"):
             if key in self.ckpt_params:
                 parts.append(f"{key}={self.ckpt_params[key]}")
+        if epoch is not None:
+            parts.append(f"epoch={epoch}")
+        if tag:
+            parts.append(tag)
         name = ".".join(parts)
         if is_best:
             name += ".best_model"
@@ -198,6 +211,8 @@ class PCVRHyFormerRankingTrainer:
         global_step: int,
         is_best: bool = False,
         skip_model_file: bool = False,
+        epoch: Optional[int] = None,
+        tag: Optional[str] = None,
     ) -> str:
         """Save ``model.pt`` plus sidecar files under a ``global_step`` sub-dir.
 
@@ -207,11 +222,15 @@ class PCVRHyFormerRankingTrainer:
             skip_model_file: if True, skip writing ``model.pt`` (because the
                 caller, e.g. EarlyStopping, has already persisted it to the
                 same path). Sidecar files are still (re)written.
+            epoch: optional epoch number appended to the checkpoint directory.
+            tag: optional suffix appended to the checkpoint directory, e.g.
+                ``snapshot``.
 
         Returns:
             The absolute path of the checkpoint directory.
         """
-        dir_name = self._build_step_dir_name(global_step, is_best=is_best)
+        dir_name = self._build_step_dir_name(
+            global_step, is_best=is_best, epoch=epoch, tag=tag)
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
@@ -374,6 +393,9 @@ class PCVRHyFormerRankingTrainer:
                 self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
+            if self.save_epoch_checkpoints:
+                self._save_step_checkpoint(
+                    total_step, epoch=epoch, tag="snapshot")
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")

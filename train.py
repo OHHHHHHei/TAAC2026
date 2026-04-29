@@ -74,6 +74,9 @@ def parse_args() -> argparse.Namespace:
                         help='AMP compute dtype when --amp is enabled')
     parser.add_argument('--tf32', action='store_true', default=False,
                         help='Enable TF32 matmul/cuDNN kernels on supported NVIDIA GPUs')
+    parser.add_argument('--save_epoch_checkpoints', action='store_true', default=False,
+                        help='Save an additional global_step*.epoch=N.snapshot checkpoint '
+                             'after each epoch validation')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -378,6 +381,7 @@ def main() -> None:
         reinit_cardinality_threshold=args.reinit_cardinality_threshold,
         amp=args.amp,
         amp_dtype=args.amp_dtype,
+        save_epoch_checkpoints=args.save_epoch_checkpoints,
         ckpt_params=ckpt_params,
         writer=writer,
         schema_path=schema_path,
