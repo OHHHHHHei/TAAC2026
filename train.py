@@ -103,6 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
+    parser.add_argument('--use_pair_features', action='store_true', default=False,
+                        help='Append dense target-item x history-sequence match features')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -283,6 +285,7 @@ def main() -> None:
         split_mode=args.split_mode,
         split_time_col=args.split_time_col,
         split_time_stat=args.split_time_stat,
+        use_pair_features=args.use_pair_features,
     )
 
     # ---- NS groups ----

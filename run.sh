@@ -11,6 +11,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --use_ns_output_fusion \
+    --use_pair_features \
     --seq_encoder_type longer \
     --seq_top_k 64 \
     --seq_max_lens seq_a:256,seq_b:256,seq_c:1024,seq_d:1024 \

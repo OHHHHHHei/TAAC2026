@@ -188,6 +188,46 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# High-confidence item-history intersections observed on the demo parquet. Each
+# spec creates three dense features: hit_any, hit_count_norm, hit_recency_score.
+PAIR_FEATURE_SPECS: Tuple[Tuple[int, str, int], ...] = (
+    (81, 'seq_a', 46),
+    (81, 'seq_c', 32),
+    (81, 'seq_a', 40),
+    (13, 'seq_d', 25),
+    (13, 'seq_a', 40),
+    (81, 'seq_d', 17),
+    (81, 'seq_c', 33),
+    (13, 'seq_c', 32),
+    (81, 'seq_b', 68),
+    (81, 'seq_d', 25),
+    (13, 'seq_a', 46),
+    (13, 'seq_b', 68),
+    (81, 'seq_b', 75),
+    (83, 'seq_b', 75),
+    (13, 'seq_a', 41),
+    (83, 'seq_d', 25),
+    (83, 'seq_b', 68),
+    (83, 'seq_a', 41),
+    (9, 'seq_b', 75),
+    (9, 'seq_a', 46),
+    (9, 'seq_d', 25),
+    (83, 'seq_a', 46),
+    (83, 'seq_c', 32),
+    (83, 'seq_a', 40),
+    (83, 'seq_c', 33),
+    (83, 'seq_d', 17),
+    (9, 'seq_a', 40),
+    (9, 'seq_a', 41),
+    (9, 'seq_b', 68),
+    (9, 'seq_c', 32),
+    (9, 'seq_c', 33),
+    (9, 'seq_d', 17),
+)
+PAIR_FEATURES_PER_SPEC = 3
+PAIR_FEATURE_ID_BASE = 900000
+PAIR_RECENCY_CAP_SECONDS = float(BUCKET_BOUNDARIES[-1])
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -211,6 +251,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_list: Optional[List[Tuple[str, int, int]]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        use_pair_features: bool = False,
     ) -> None:
         """
         Args:
@@ -230,6 +271,8 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            use_pair_features: append item-history pair match statistics to
+                ``user_dense_feats``.
         """
         super().__init__()
 
@@ -248,6 +291,8 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.use_pair_features = use_pair_features
+        self._pair_feature_specs = list(PAIR_FEATURE_SPECS) if use_pair_features else []
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -283,12 +328,14 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_ts = {}
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_ts[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -327,6 +374,8 @@ class PCVRParquetDataset(IterableDataset):
             ts_ci = self._col_idx.get(f'{prefix}_{ts_fid}') if ts_fid is not None else None
             self._seq_plan[domain] = (side_plan, ts_ci)
 
+        self._build_pair_feature_plan()
+
         logging.info(
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
@@ -358,6 +407,16 @@ class PCVRParquetDataset(IterableDataset):
         self.user_dense_schema: FeatureSchema = FeatureSchema()
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
+        self._pair_feature_start_offset = self.user_dense_schema.total_dim
+        if self._pair_feature_specs:
+            for i, _ in enumerate(self._pair_feature_specs):
+                self.user_dense_schema.add(
+                    PAIR_FEATURE_ID_BASE + i,
+                    PAIR_FEATURES_PER_SPEC,
+                )
+        self._pair_feature_dim = (
+            len(self._pair_feature_specs) * PAIR_FEATURES_PER_SPEC
+        )
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -391,6 +450,42 @@ class PCVRParquetDataset(IterableDataset):
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
+
+    def _build_pair_feature_plan(self) -> None:
+        """Resolve pair feature specs to item offsets and sequence slots."""
+        self._pair_feature_plan: List[Tuple[int, str, int, int, int, int, int]] = []
+        if not self._pair_feature_specs:
+            return
+
+        item_lookup = {
+            fid: (offset, length)
+            for fid, offset, length in self.item_int_schema.entries
+        }
+        seq_slot_lookup = {
+            domain: {fid: slot for slot, fid in enumerate(self.sideinfo_fids[domain])}
+            for domain in self.seq_domains
+        }
+
+        active = 0
+        for i, (item_fid, domain, seq_fid) in enumerate(self._pair_feature_specs):
+            out_offset = self._pair_feature_start_offset + i * PAIR_FEATURES_PER_SPEC
+            item_entry = item_lookup.get(item_fid)
+            seq_slot = seq_slot_lookup.get(domain, {}).get(seq_fid)
+            if item_entry is None or seq_slot is None:
+                logging.warning(
+                    "Pair feature spec skipped: item_int_feats_%s x %s_%s "
+                    "is not present in schema",
+                    item_fid, domain, seq_fid)
+                continue
+            item_offset, item_len = item_entry
+            self._pair_feature_plan.append(
+                (item_fid, domain, seq_fid, item_offset, item_len, seq_slot, out_offset)
+            )
+            active += 1
+
+        logging.info(
+            "Pair dense features enabled: %d specs, %d active, +%d dims",
+            len(self._pair_feature_specs), active, self._pair_feature_dim)
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -565,6 +660,71 @@ class PCVRParquetDataset(IterableDataset):
 
         return padded
 
+    def _fill_pair_features(
+        self,
+        user_dense: "npt.NDArray[np.float32]",
+        item_int: "npt.NDArray[np.int64]",
+        seq_values: Dict[str, "npt.NDArray[np.int64]"],
+        seq_timestamps: Dict[str, "npt.NDArray[np.int64]"],
+        timestamps: "npt.NDArray[np.int64]",
+    ) -> None:
+        """Append item-history match statistics into ``user_dense`` in place."""
+        if not self._pair_feature_plan:
+            return
+
+        row_timestamps = timestamps.reshape(-1, 1)
+        log_cap = np.log1p(PAIR_RECENCY_CAP_SECONDS)
+
+        for _, domain, _, item_offset, item_len, seq_slot, out_offset in self._pair_feature_plan:
+            domain_values = seq_values.get(domain)
+            if domain_values is None:
+                continue
+
+            targets = item_int[:, item_offset:item_offset + item_len]
+            seq_matrix = domain_values[:, seq_slot, :]
+            valid_seq = seq_matrix > 0
+
+            if item_len == 1:
+                target = targets[:, 0]
+                match = (
+                    valid_seq
+                    & (target.reshape(-1, 1) > 0)
+                    & (seq_matrix == target.reshape(-1, 1))
+                )
+            else:
+                target_valid = targets > 0
+                match = (
+                    valid_seq[:, :, None]
+                    & target_valid[:, None, :]
+                    & (seq_matrix[:, :, None] == targets[:, None, :])
+                ).any(axis=2)
+
+            counts = match.sum(axis=1).astype(np.float32)
+            valid_counts = np.maximum(valid_seq.sum(axis=1).astype(np.float32), 1.0)
+            user_dense[:, out_offset] = (counts > 0).astype(np.float32)
+            user_dense[:, out_offset + 1] = (
+                np.log1p(counts) / np.log1p(valid_counts)
+            ).astype(np.float32)
+
+            ts_matrix = seq_timestamps.get(domain)
+            if ts_matrix is None:
+                user_dense[:, out_offset + 2] = 0.0
+                continue
+
+            valid_match_ts = match & (ts_matrix > 0)
+            deltas = np.where(
+                valid_match_ts,
+                np.maximum(row_timestamps - ts_matrix, 0),
+                PAIR_RECENCY_CAP_SECONDS,
+            )
+            min_delta = deltas.min(axis=1).astype(np.float32)
+            recency = 1.0 - np.minimum(
+                np.log1p(min_delta) / log_cap,
+                1.0,
+            )
+            recency[counts <= 0] = 0.0
+            user_dense[:, out_offset + 2] = recency.astype(np.float32)
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -635,7 +795,6 @@ class PCVRParquetDataset(IterableDataset):
 
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
-            'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
@@ -645,6 +804,8 @@ class PCVRParquetDataset(IterableDataset):
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
+        seq_values: Dict[str, "npt.NDArray[np.int64]"] = {}
+        seq_timestamps: Dict[str, "npt.NDArray[np.int64]"] = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
@@ -693,12 +854,13 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            ts_padded = self._buf_seq_ts[domain][:B]
+            ts_padded[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
                 # Pad timestamps into shape (B, max_len).
-                ts_padded = np.zeros((B, max_len), dtype=np.int64)
                 for i in range(B):
                     s = int(ts_offs[i])
                     e = int(ts_offs[i + 1])
@@ -728,6 +890,18 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            seq_values[domain] = out
+            seq_timestamps[domain] = ts_padded
+
+        if self.use_pair_features:
+            self._fill_pair_features(
+                user_dense=user_dense,
+                item_int=item_int,
+                seq_values=seq_values,
+                seq_timestamps=seq_timestamps,
+                timestamps=timestamps,
+            )
+        result['user_dense_feats'] = torch.from_numpy(user_dense.copy())
 
         return result
 
@@ -747,6 +921,7 @@ def get_pcvr_data(
     split_mode: str = 'row_group',
     split_time_col: str = 'timestamp',
     split_time_stat: str = 'median',
+    use_pair_features: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -815,6 +990,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_list=train_rg_info,
         clip_vocab=clip_vocab,
+        use_pair_features=use_pair_features,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -837,6 +1013,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_list=valid_rg_info,
         clip_vocab=clip_vocab,
+        use_pair_features=use_pair_features,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
