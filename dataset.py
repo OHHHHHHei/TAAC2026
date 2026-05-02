@@ -189,7 +189,8 @@ BUCKET_BOUNDARIES = np.array([
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
 # High-confidence item-history intersections observed on the demo parquet. Each
-# spec creates three dense features: hit_any, hit_count_norm, hit_recency_score.
+# spec creates five dense features: hit_any, hit_count_norm, hit_recency_score,
+# hit_in_recent_20, hit_in_recent_100.
 PAIR_FEATURE_SPECS: Tuple[Tuple[int, str, int], ...] = (
     (81, 'seq_a', 46),
     (81, 'seq_c', 32),
@@ -223,10 +224,43 @@ PAIR_FEATURE_SPECS: Tuple[Tuple[int, str, int], ...] = (
     (9, 'seq_c', 32),
     (9, 'seq_c', 33),
     (9, 'seq_d', 17),
+    (13, 'seq_b', 75),
+    (13, 'seq_b', 77),
+    (13, 'seq_d', 17),
+    (13, 'seq_a', 42),
+    (13, 'seq_d', 18),
+    (10, 'seq_d', 18),
+    (10, 'seq_d', 24),
+    (9, 'seq_c', 28),
+    (5, 'seq_d', 18),
+    (9, 'seq_b', 77),
+    (81, 'seq_a', 42),
+    (5, 'seq_d', 19),
+    (6, 'seq_c', 30),
+    (5, 'seq_d', 25),
+    (6, 'seq_d', 18),
+    (5, 'seq_b', 77),
+    (10, 'seq_d', 19),
+    (10, 'seq_b', 77),
+    (9, 'seq_d', 19),
+    (9, 'seq_d', 18),
+    (5, 'seq_c', 30),
+    (6, 'seq_d', 19),
+    (5, 'seq_b', 68),
+    (13, 'seq_b', 70),
+    (7, 'seq_d', 19),
+    (6, 'seq_b', 70),
+    (10, 'seq_c', 30),
+    (12, 'seq_d', 19),
+    (9, 'seq_b', 78),
+    (12, 'seq_d', 18),
+    (81, 'seq_b', 77),
+    (10, 'seq_b', 75),
 )
-PAIR_FEATURES_PER_SPEC = 3
+PAIR_FEATURES_PER_SPEC = 5
 PAIR_FEATURE_ID_BASE = 900000
 PAIR_RECENCY_CAP_SECONDS = float(BUCKET_BOUNDARIES[-1])
+PAIR_RECENT_WINDOWS: Tuple[int, int] = (20, 100)
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -705,6 +739,11 @@ class PCVRParquetDataset(IterableDataset):
             user_dense[:, out_offset + 1] = (
                 np.log1p(counts) / np.log1p(valid_counts)
             ).astype(np.float32)
+
+            for j, window in enumerate(PAIR_RECENT_WINDOWS):
+                user_dense[:, out_offset + 3 + j] = (
+                    match[:, :window].any(axis=1).astype(np.float32)
+                )
 
             ts_matrix = seq_timestamps.get(domain)
             if ts_matrix is None:
