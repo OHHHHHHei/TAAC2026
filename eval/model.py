@@ -1186,13 +1186,13 @@ class RankMixerNSTokenizer(nn.Module):
 
 
 class AlignedDenseIntTokenizer(nn.Module):
-    """Two-token user dense tokenizer aware of aligned dense/int fids.
+    """User dense tokenizer aware of aligned dense/int fids.
 
     Some user dense features share the same fid and list length as user int
     features. For those fields, each dense value is a per-id weight rather than
     an independent flat scalar. This tokenizer keeps pair/raw dense features in
-    one token and creates a second token by dense-weighting the corresponding
-    sparse id embeddings.
+    one token and creates additional tokens by dense-weighting the corresponding
+    sparse id embeddings in fid chunks.
     """
 
     ALIGNED_FIDS = (62, 63, 64, 65, 66, 89, 90, 91)
@@ -1204,11 +1204,14 @@ class AlignedDenseIntTokenizer(nn.Module):
         user_dense_feature_specs: List[Tuple[int, int, int]],
         emb_dim: int,
         d_model: int,
+        num_tokens: int = 2,
         emb_skip_threshold: int = 0,
     ) -> None:
         super().__init__()
         self.emb_dim = emb_dim
         self.d_model = d_model
+        self.num_tokens = max(2, int(num_tokens))
+        self.num_aligned_tokens = self.num_tokens - 1
         self.emb_skip_threshold = emb_skip_threshold
 
         int_by_fid = {
@@ -1256,16 +1259,27 @@ class AlignedDenseIntTokenizer(nn.Module):
                 self._emb_index.append(real_idx)
                 real_idx += 1
 
-        aligned_dim = max(len(self.aligned_specs), 1) * emb_dim
-        self.aligned_proj = nn.Sequential(
-            nn.Linear(aligned_dim, d_model),
-            nn.LayerNorm(d_model),
-        )
-        self._empty_aligned_dim = aligned_dim
+        aligned_count = len(self.aligned_specs)
+        chunk_size = max(1, math.ceil(max(aligned_count, 1) / self.num_aligned_tokens))
+        self.aligned_chunks = [
+            list(range(start, min(start + chunk_size, aligned_count)))
+            for start in range(0, aligned_count, chunk_size)
+        ]
+        while len(self.aligned_chunks) < self.num_aligned_tokens:
+            self.aligned_chunks.append([])
+
+        self.aligned_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(max(len(chunk), 1) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for chunk in self.aligned_chunks
+        ])
 
         logging.info(
-            "AlignedDenseIntTokenizer: raw_dim=%d, aligned_fids=%s, "
-            "active_embeddings=%d",
+            "AlignedDenseIntTokenizer: tokens=%d, raw_dim=%d, "
+            "aligned_fids=%s, active_embeddings=%d",
+            self.num_tokens,
             raw_dim,
             [fid for fid, *_ in self.aligned_specs],
             len(self.embs),
@@ -1303,12 +1317,14 @@ class AlignedDenseIntTokenizer(nn.Module):
                 fid_emb = (emb_all * weights.unsqueeze(-1)).sum(dim=1) / denom
             aligned_embs.append(fid_emb)
 
-        if aligned_embs:
-            aligned_dense = torch.cat(aligned_embs, dim=-1)
-        else:
-            aligned_dense = user_dense_feats.new_zeros(B, self._empty_aligned_dim)
-        aligned_token = F.silu(self.aligned_proj(aligned_dense)).unsqueeze(1)
-        return torch.cat([raw_token, aligned_token], dim=1)
+        aligned_tokens = []
+        for chunk, proj in zip(self.aligned_chunks, self.aligned_projs):
+            if chunk:
+                aligned_dense = torch.cat([aligned_embs[i] for i in chunk], dim=-1)
+            else:
+                aligned_dense = user_dense_feats.new_zeros(B, self.emb_dim)
+            aligned_tokens.append(F.silu(proj(aligned_dense)).unsqueeze(1))
+        return torch.cat([raw_token] + aligned_tokens, dim=1)
 
 
 class PCVRHyFormer(nn.Module):
@@ -1355,6 +1371,7 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         use_aligned_dense_int: bool = False,
+        aligned_dense_int_tokens: int = 2,
     ) -> None:
         super().__init__()
 
@@ -1372,6 +1389,7 @@ class PCVRHyFormer(nn.Module):
         self.use_ns_output_fusion = use_ns_output_fusion
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_aligned_dense_int = use_aligned_dense_int
+        self.aligned_dense_int_tokens = max(2, int(aligned_dense_int_tokens))
 
         # ================== NS Tokens Construction ==================
 
@@ -1437,9 +1455,10 @@ class PCVRHyFormer(nn.Module):
                     user_dense_feature_specs=user_dense_feature_specs,
                     emb_dim=emb_dim,
                     d_model=d_model,
+                    num_tokens=self.aligned_dense_int_tokens,
                     emb_skip_threshold=emb_skip_threshold,
                 )
-                num_user_dense_ns = 2
+                num_user_dense_ns = self.user_dense_proj.num_tokens
             else:
                 self.user_dense_proj = nn.Sequential(
                     nn.Linear(user_dense_dim, d_model),

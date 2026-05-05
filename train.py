@@ -201,6 +201,11 @@ def parse_args() -> argparse.Namespace:
                         help='Replace the flat user-dense token with two structured '
                              'tokens: raw/non-aligned dense features and dense-weighted '
                              'aligned user-int embeddings.')
+    parser.add_argument('--aligned_dense_int_tokens', type=int, default=2,
+                        help='Number of user dense tokens emitted when '
+                             '--use_aligned_dense_int is enabled. One token is '
+                             'reserved for raw/non-aligned dense features; the '
+                             'remaining tokens split aligned dense-int fids.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -346,6 +351,7 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_aligned_dense_int": args.use_aligned_dense_int,
+        "aligned_dense_int_tokens": args.aligned_dense_int_tokens,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
