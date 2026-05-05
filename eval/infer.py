@@ -69,6 +69,7 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'use_aligned_dense_int': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -230,6 +231,8 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        user_int_feature_fids=dataset.user_int_schema.feature_ids,
+        user_dense_feature_specs=dataset.user_dense_schema.entries,
         **model_cfg,
     ).to(device)
 

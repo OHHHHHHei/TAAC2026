@@ -5,13 +5,14 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --use_ns_output_fusion \
     --use_pair_features \
+    --use_aligned_dense_int \
     --seq_encoder_type longer \
     --seq_top_k 64 \
     --seq_max_lens seq_a:256,seq_b:256,seq_c:1024,seq_d:1024 \

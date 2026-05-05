@@ -1185,6 +1185,132 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class AlignedDenseIntTokenizer(nn.Module):
+    """Two-token user dense tokenizer aware of aligned dense/int fids.
+
+    Some user dense features share the same fid and list length as user int
+    features. For those fields, each dense value is a per-id weight rather than
+    an independent flat scalar. This tokenizer keeps pair/raw dense features in
+    one token and creates a second token by dense-weighting the corresponding
+    sparse id embeddings.
+    """
+
+    ALIGNED_FIDS = (62, 63, 64, 65, 66, 89, 90, 91)
+
+    def __init__(
+        self,
+        user_int_feature_specs: List[Tuple[int, int, int]],
+        user_int_feature_fids: List[int],
+        user_dense_feature_specs: List[Tuple[int, int, int]],
+        emb_dim: int,
+        d_model: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.d_model = d_model
+        self.emb_skip_threshold = emb_skip_threshold
+
+        int_by_fid = {
+            fid: (vs, offset, length)
+            for fid, (vs, offset, length) in zip(user_int_feature_fids, user_int_feature_specs)
+        }
+        dense_by_fid = {
+            fid: (offset, length)
+            for fid, offset, length in user_dense_feature_specs
+        }
+
+        self.raw_dense_slices = [
+            (offset, length)
+            for fid, offset, length in user_dense_feature_specs
+            if fid not in self.ALIGNED_FIDS
+        ]
+        raw_dim = sum(length for _, length in self.raw_dense_slices)
+        self.raw_dense_proj = nn.Sequential(
+            nn.Linear(max(raw_dim, 1), d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.raw_dim = raw_dim
+
+        self.aligned_specs: List[Tuple[int, int, int, int, int, int]] = []
+        embs = []
+        for fid in self.ALIGNED_FIDS:
+            if fid not in int_by_fid or fid not in dense_by_fid:
+                continue
+            vs, int_offset, int_length = int_by_fid[fid]
+            dense_offset, dense_length = dense_by_fid[fid]
+            length = min(int_length, dense_length)
+            if length <= 0:
+                continue
+            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            embs.append(None if skip else nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+            self.aligned_specs.append((fid, int(vs), int_offset, dense_offset, length, len(embs) - 1))
+
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is None:
+                self._emb_index.append(-1)
+            else:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+
+        aligned_dim = max(len(self.aligned_specs), 1) * emb_dim
+        self.aligned_proj = nn.Sequential(
+            nn.Linear(aligned_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self._empty_aligned_dim = aligned_dim
+
+        logging.info(
+            "AlignedDenseIntTokenizer: raw_dim=%d, aligned_fids=%s, "
+            "active_embeddings=%d",
+            raw_dim,
+            [fid for fid, *_ in self.aligned_specs],
+            len(self.embs),
+        )
+
+    def forward(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        B = user_dense_feats.shape[0]
+        raw_parts = [
+            user_dense_feats[:, offset:offset + length]
+            for offset, length in self.raw_dense_slices
+        ]
+        if raw_parts:
+            raw_dense = torch.cat(raw_parts, dim=-1)
+        else:
+            raw_dense = user_dense_feats.new_zeros(B, 1)
+        raw_token = F.silu(self.raw_dense_proj(raw_dense)).unsqueeze(1)
+
+        aligned_embs = []
+        for local_idx, (_, _, int_offset, dense_offset, length, _) in enumerate(self.aligned_specs):
+            real_idx = self._emb_index[local_idx]
+            if real_idx == -1:
+                fid_emb = user_dense_feats.new_zeros(B, self.emb_dim)
+            else:
+                vals = user_int_feats[:, int_offset:int_offset + length].long()
+                weights = user_dense_feats[:, dense_offset:dense_offset + length].to(torch.float32)
+                weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+                mask = (vals != 0).to(weights.dtype)
+                weights = weights * mask
+                emb_all = self.embs[real_idx](vals)
+                denom = weights.abs().sum(dim=1, keepdim=True).clamp(min=1.0)
+                fid_emb = (emb_all * weights.unsqueeze(-1)).sum(dim=1) / denom
+            aligned_embs.append(fid_emb)
+
+        if aligned_embs:
+            aligned_dense = torch.cat(aligned_embs, dim=-1)
+        else:
+            aligned_dense = user_dense_feats.new_zeros(B, self._empty_aligned_dim)
+        aligned_token = F.silu(self.aligned_proj(aligned_dense)).unsqueeze(1)
+        return torch.cat([raw_token, aligned_token], dim=1)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1203,6 +1329,8 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_int_feature_fids: Optional[List[int]] = None,
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1226,6 +1354,7 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        use_aligned_dense_int: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1242,6 +1371,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.use_ns_output_fusion = use_ns_output_fusion
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_aligned_dense_int = use_aligned_dense_int
 
         # ================== NS Tokens Construction ==================
 
@@ -1296,10 +1426,28 @@ class PCVRHyFormer(nn.Module):
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
-                nn.LayerNorm(d_model),
-            )
+            if use_aligned_dense_int:
+                if user_int_feature_fids is None or user_dense_feature_specs is None:
+                    raise ValueError(
+                        "use_aligned_dense_int requires user_int_feature_fids "
+                        "and user_dense_feature_specs")
+                self.user_dense_proj = AlignedDenseIntTokenizer(
+                    user_int_feature_specs=user_int_feature_specs,
+                    user_int_feature_fids=user_int_feature_fids,
+                    user_dense_feature_specs=user_dense_feature_specs,
+                    emb_dim=emb_dim,
+                    d_model=d_model,
+                    emb_skip_threshold=emb_skip_threshold,
+                )
+                num_user_dense_ns = 2
+            else:
+                self.user_dense_proj = nn.Sequential(
+                    nn.Linear(user_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                num_user_dense_ns = 1
+        else:
+            num_user_dense_ns = 0
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1310,7 +1458,7 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_ns = (num_user_ns + num_user_dense_ns
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
@@ -1468,6 +1616,10 @@ class PCVRHyFormer(nn.Module):
             for emb in tokenizer.embs:
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
+        if isinstance(getattr(self, 'user_dense_proj', None), AlignedDenseIntTokenizer):
+            for emb in self.user_dense_proj.embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
 
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
@@ -1518,6 +1670,20 @@ class PCVRHyFormer(nn.Module):
                 if real_idx == -1:
                     continue
                 emb = tokenizer.embs[real_idx]
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
+        if isinstance(getattr(self, 'user_dense_proj', None), AlignedDenseIntTokenizer):
+            for local_idx, (_, vs, _, _, _, _) in enumerate(self.user_dense_proj.aligned_specs):
+                real_idx = self.user_dense_proj._emb_index[local_idx]
+                if real_idx == -1:
+                    continue
+                emb = self.user_dense_proj.embs[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
                     emb.weight.data[0, :] = 0
@@ -1657,7 +1823,10 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            if self.use_aligned_dense_int:
+                user_dense_tok = self.user_dense_proj(inputs.user_int_feats, inputs.user_dense_feats)
+            else:
+                user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1701,7 +1870,10 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            if self.use_aligned_dense_int:
+                user_dense_tok = self.user_dense_proj(inputs.user_int_feats, inputs.user_dense_feats)
+            else:
+                user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:

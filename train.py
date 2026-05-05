@@ -197,6 +197,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_ns_output_fusion', action='store_true', default=False,
                         help='Fuse pooled final NS tokens with sequence-query output '
                              'before the classifier.')
+    parser.add_argument('--use_aligned_dense_int', action='store_true', default=False,
+                        help='Replace the flat user-dense token with two structured '
+                             'tokens: raw/non-aligned dense features and dense-weighted '
+                             'aligned user-int embeddings.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -318,6 +322,8 @@ def main() -> None:
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
+        "user_int_feature_fids": pcvr_dataset.user_int_schema.feature_ids,
+        "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
         "d_model": args.d_model,
         "emb_dim": args.emb_dim,
         "num_queries": args.num_queries,
@@ -339,6 +345,7 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_aligned_dense_int": args.use_aligned_dense_int,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
