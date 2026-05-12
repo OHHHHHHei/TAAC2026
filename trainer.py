@@ -32,7 +32,7 @@ class PCVRHyFormerRankingTrainer:
     - seq_a, seq_b, seq_c, seq_d (each with *_len companion)
     - label (binary)
 
-    Loss: BCEWithLogitsLoss or Focal Loss.
+    Loss: BCEWithLogitsLoss, Focal Loss, or a BCE/Focal blend.
     Metrics: BinaryAUROC + binary logloss.
     """
 
@@ -49,6 +49,7 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        focal_blend_weight: float = 0.3,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -104,6 +105,10 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.focal_blend_weight: float = focal_blend_weight
+        if not 0.0 <= self.focal_blend_weight <= 1.0:
+            raise ValueError(
+                f"focal_blend_weight must be in [0, 1], got {focal_blend_weight}")
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -136,6 +141,7 @@ class PCVRHyFormerRankingTrainer:
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                     f"focal_blend_weight={focal_blend_weight}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"amp_enabled={self.amp_enabled}, "
                      f"amp_dtype={self.amp_dtype_name}, "
@@ -472,10 +478,21 @@ class PCVRHyFormerRankingTrainer:
             logits = self.model(model_input)  # (B, 1)
             logits = logits.squeeze(-1)  # (B,)
 
+            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
             if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+                loss = sigmoid_focal_loss(
+                    logits, label,
+                    alpha=self.focal_alpha,
+                    gamma=self.focal_gamma)
+            elif self.loss_type == 'bce_focal_blend':
+                focal_loss = sigmoid_focal_loss(
+                    logits, label,
+                    alpha=self.focal_alpha,
+                    gamma=self.focal_gamma)
+                w = self.focal_blend_weight
+                loss = (1.0 - w) * bce_loss + w * focal_loss
             else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+                loss = bce_loss
 
         if self.grad_scaler.is_enabled():
             self.grad_scaler.scale(loss).backward()

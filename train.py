@@ -105,6 +105,36 @@ def parse_args() -> argparse.Namespace:
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
     parser.add_argument('--use_pair_features', action='store_true', default=False,
                         help='Append dense target-item x history-sequence match features')
+    parser.add_argument('--use_pair_time_features', action='store_true', default=False,
+                        help='Append target-aware real-time-window pair match flags '
+                             'on top of --use_pair_features')
+    parser.add_argument('--use_calendar_time_features', action='store_true', default=False,
+                        help='Append cyclic sample timestamp features '
+                             '(hour/day-of-week/day-of-month) to user dense feats')
+    parser.add_argument('--use_calendar_bucket_features', action='store_true', default=False,
+                        help='Append low-cardinality sample timestamp buckets '
+                             '(hour/weekday/hour-weekday/10-minute) to user int feats')
+    parser.add_argument('--use_seq_time_bucket_features', action='store_true', default=False,
+                        help='Append low-cardinality per-domain sequence time '
+                             'summary buckets to user int feats')
+    parser.add_argument('--use_seq_time_features', action='store_true', default=False,
+                        help='Append per-domain sequence timestamp summary features '
+                             'to user dense feats')
+    parser.add_argument('--use_seq_trunc_features', action='store_true', default=False,
+                        help='Append per-domain raw length and truncation summary '
+                             'features to user dense feats')
+    parser.add_argument('--use_missing_indicator_features', action='store_true',
+                        default=False,
+                        help='Append binary dense flags for raw missing/invalid '
+                             'non-sequence user/item features')
+    parser.add_argument('--use_typed_missing_indicator_features', action='store_true',
+                        default=False,
+                        help='Append finer-grained dense missing flags and '
+                             'side-level missing ratios')
+    parser.add_argument('--use_missing_sparse_buckets', action='store_true',
+                        default=False,
+                        help='Map raw missing/invalid non-sequence int ids to '
+                             'a learned per-feature sparse bucket instead of 0')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -156,14 +186,19 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
+    parser.add_argument('--loss_type', type=str, default='bce',
+                        choices=['bce', 'focal', 'bce_focal_blend'],
+                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
+                             'bce_focal_blend = weighted BCE/Focal blend')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
-                             '(effective only when --loss_type=focal)')
+                             '(effective when --loss_type=focal or bce_focal_blend)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
-                             '(effective only when --loss_type=focal)')
+                             '(effective when --loss_type=focal or bce_focal_blend)')
+    parser.add_argument('--focal_blend_weight', type=float, default=0.3,
+                        help='Focal component weight for --loss_type=bce_focal_blend; '
+                             '0.3 means 0.7 * BCE + 0.3 * Focal')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -206,6 +241,22 @@ def parse_args() -> argparse.Namespace:
                              '--use_aligned_dense_int is enabled. One token is '
                              'reserved for raw/non-aligned dense features; the '
                              'remaining tokens split aligned dense-int fids.')
+    parser.add_argument('--use_grouped_raw_dense_proj', action='store_true',
+                        default=False,
+                        help='Within --use_aligned_dense_int, project raw '
+                             'dense feature groups separately before fusing '
+                             'them back into one raw dense token.')
+    parser.add_argument('--use_engineered_dense_token', action='store_true',
+                        default=False,
+                        help='Within --use_aligned_dense_int, split raw user '
+                             'dense into a base token and a dedicated token '
+                             'for engineered pair/time/sequence/missing features.')
+    parser.add_argument('--use_time_context_gate', action='store_true', default=False,
+                        help='Add a small gated residual from user dense/time '
+                             'features to the final classifier representation.')
+    parser.add_argument('--use_target_din', action='store_true', default=False,
+                        help='Add a lightweight DIN-style target-item attention '
+                             'branch over history sequence tokens before the classifier.')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -295,6 +346,15 @@ def main() -> None:
         split_time_col=args.split_time_col,
         split_time_stat=args.split_time_stat,
         use_pair_features=args.use_pair_features,
+        use_pair_time_features=args.use_pair_time_features,
+        use_calendar_time_features=args.use_calendar_time_features,
+        use_calendar_bucket_features=args.use_calendar_bucket_features,
+        use_seq_time_bucket_features=args.use_seq_time_bucket_features,
+        use_seq_time_features=args.use_seq_time_features,
+        use_seq_trunc_features=args.use_seq_trunc_features,
+        use_missing_indicator_features=args.use_missing_indicator_features,
+        use_typed_missing_indicator_features=args.use_typed_missing_indicator_features,
+        use_missing_sparse_buckets=args.use_missing_sparse_buckets,
     )
 
     # ---- NS groups ----
@@ -352,6 +412,10 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "use_aligned_dense_int": args.use_aligned_dense_int,
         "aligned_dense_int_tokens": args.aligned_dense_int_tokens,
+        "use_grouped_raw_dense_proj": args.use_grouped_raw_dense_proj,
+        "use_engineered_dense_token": args.use_engineered_dense_token,
+        "use_time_context_gate": args.use_time_context_gate,
+        "use_target_din": args.use_target_din,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -391,6 +455,7 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        focal_blend_weight=args.focal_blend_weight,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,

@@ -226,9 +226,67 @@ PAIR_FEATURE_SPECS: Tuple[Tuple[int, str, int], ...] = (
     (9, 'seq_d', 17),
 )
 PAIR_FEATURES_PER_SPEC = 5
+PAIR_TIME_FEATURES_PER_SPEC = 4
 PAIR_FEATURE_ID_BASE = 900000
 PAIR_RECENCY_CAP_SECONDS = float(BUCKET_BOUNDARIES[-1])
 PAIR_RECENT_WINDOWS: Tuple[int, int] = (20, 100)
+PAIR_TIME_WINDOWS_SECONDS: Tuple[int, int, int, int] = (
+    1800,    # 30 minutes
+    7200,    # 2 hours
+    86400,   # 1 day
+    604800,  # 7 days
+)
+
+CALENDAR_TIME_FEATURE_ID = 910000
+CALENDAR_TIME_FEATURE_DIM = 7
+LOCAL_TIME_OFFSET_SECONDS = 8 * 3600
+
+CALENDAR_BUCKET_FEATURES: Tuple[Tuple[str, int, int], ...] = (
+    ('hour', 940000, 24),
+    ('weekday', 940001, 7),
+    ('hour_weekday', 940002, 168),
+    ('ten_minute', 940003, 144),
+)
+
+SEQ_LEN_BUCKET_BOUNDARIES = np.array([
+    1, 2, 3, 5, 8, 13, 20, 32, 50,
+    80, 128, 192, 256, 384, 512, 768, 1024,
+], dtype=np.int64)
+SEQ_TIME_BUCKET_FEATURE_ID_BASE = 950000
+SEQ_TIME_BUCKET_FEATURES: Tuple[Tuple[str, int], ...] = (
+    ('last_recency', len(BUCKET_BOUNDARIES)),
+    ('full_span', len(BUCKET_BOUNDARIES)),
+    ('valid_len', len(SEQ_LEN_BUCKET_BOUNDARIES)),
+)
+
+SEQ_TIME_FEATURE_ID_BASE = 920000
+SEQ_TIME_FEATURES_PER_DOMAIN = 7
+SEQ_TIME_RECENT_WINDOWS: Tuple[int, int, int] = (3600, 86400, 604800)
+
+SEQ_TRUNC_FEATURE_ID_BASE = 930000
+SEQ_TRUNC_FEATURES_PER_DOMAIN = 6
+SEQ_TRUNC_LEN_CAP_MULT = 4
+
+MISSING_INDICATOR_FEATURE_ID = 990000
+TYPED_MISSING_INDICATOR_FEATURE_ID = 990001
+INT_TYPED_MISSING_FEATURES_PER_SPEC = 3
+DENSE_TYPED_MISSING_FEATURES_PER_SPEC = 2
+TYPED_MISSING_SUMMARY_DIM = 8
+
+
+def _bucketize_with_padding(
+    values: "npt.NDArray[np.int64]",
+    boundaries: "npt.NDArray[np.int64]",
+    valid_mask: "npt.NDArray[np.bool_]",
+) -> "npt.NDArray[np.int64]":
+    """Map nonnegative values to 1-based buckets while preserving 0 padding."""
+    out = np.zeros_like(values, dtype=np.int64)
+    if not valid_mask.any():
+        return out
+    raw = np.searchsorted(boundaries, values[valid_mask])
+    raw = np.clip(raw, 0, len(boundaries) - 1)
+    out[valid_mask] = raw.astype(np.int64) + 1
+    return out
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -254,6 +312,15 @@ class PCVRParquetDataset(IterableDataset):
         clip_vocab: bool = True,
         is_training: bool = True,
         use_pair_features: bool = False,
+        use_pair_time_features: bool = False,
+        use_calendar_time_features: bool = False,
+        use_calendar_bucket_features: bool = False,
+        use_seq_time_bucket_features: bool = False,
+        use_seq_time_features: bool = False,
+        use_seq_trunc_features: bool = False,
+        use_missing_indicator_features: bool = False,
+        use_typed_missing_indicator_features: bool = False,
+        use_missing_sparse_buckets: bool = False,
     ) -> None:
         """
         Args:
@@ -275,6 +342,29 @@ class PCVRParquetDataset(IterableDataset):
                 if False, return an all-zeros label column.
             use_pair_features: append item-history pair match statistics to
                 ``user_dense_feats``.
+            use_pair_time_features: append target-aware real-time-window match
+                flags for each pair feature spec.
+            use_calendar_time_features: append cyclic sample-level calendar
+                features derived from the row ``timestamp`` to
+                ``user_dense_feats``.
+            use_calendar_bucket_features: append low-cardinality sample-level
+                calendar buckets derived from the row ``timestamp`` to
+                ``user_int_feats``.
+            use_seq_time_bucket_features: append low-cardinality per-domain
+                sequence time summary buckets to ``user_int_feats``.
+            use_seq_time_features: append per-domain sequence timestamp
+                summary features to ``user_dense_feats``.
+            use_seq_trunc_features: append per-domain raw length and truncation
+                summary features to ``user_dense_feats``.
+            use_missing_indicator_features: append binary dense flags that
+                distinguish raw missing/invalid non-sequence features from
+                normal padding index 0.
+            use_typed_missing_indicator_features: append finer-grained dense
+                missing flags for absent/short, non-positive, OOB, and dense
+                zero-like states, plus compact ratio summaries.
+            use_missing_sparse_buckets: map raw missing/invalid non-sequence
+                int ids to the per-feature spare bucket ``vocab_size`` instead
+                of padding 0, letting embeddings learn the invalid state.
         """
         super().__init__()
 
@@ -294,7 +384,20 @@ class PCVRParquetDataset(IterableDataset):
         self.clip_vocab = clip_vocab
         self.is_training = is_training
         self.use_pair_features = use_pair_features
+        self.use_pair_time_features = use_pair_time_features
+        self.use_calendar_time_features = use_calendar_time_features
+        self.use_calendar_bucket_features = use_calendar_bucket_features
+        self.use_seq_time_bucket_features = use_seq_time_bucket_features
+        self.use_seq_time_features = use_seq_time_features
+        self.use_seq_trunc_features = use_seq_trunc_features
+        self.use_missing_indicator_features = use_missing_indicator_features
+        self.use_typed_missing_indicator_features = use_typed_missing_indicator_features
+        self.use_missing_sparse_buckets = use_missing_sparse_buckets
         self._pair_feature_specs = list(PAIR_FEATURE_SPECS) if use_pair_features else []
+        self._pair_features_per_spec = (
+            PAIR_FEATURES_PER_SPEC
+            + (PAIR_TIME_FEATURES_PER_SPEC if use_pair_time_features else 0)
+        )
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -362,6 +465,41 @@ class PCVRParquetDataset(IterableDataset):
             self._user_dense_plan.append((ci, dim, offset))
             offset += dim
 
+        self._missing_indicator_plan = []
+        if self.use_missing_indicator_features:
+            out_offset = self._missing_indicator_offset
+            for fid, vs, dim in self._user_int_cols:
+                ci = self._col_idx.get(f'user_int_feats_{fid}')
+                self._missing_indicator_plan.append(('int', ci, dim, vs, out_offset))
+                out_offset += 1
+            for fid, vs, dim in self._item_int_cols:
+                ci = self._col_idx.get(f'item_int_feats_{fid}')
+                self._missing_indicator_plan.append(('int', ci, dim, vs, out_offset))
+                out_offset += 1
+            for fid, dim in self._user_dense_cols:
+                ci = self._col_idx.get(f'user_dense_feats_{fid}')
+                self._missing_indicator_plan.append(('dense', ci, dim, 0, out_offset))
+                out_offset += 1
+
+        self._typed_missing_indicator_plan = []
+        if self.use_typed_missing_indicator_features:
+            out_offset = self._typed_missing_indicator_offset
+            for fid, vs, dim in self._user_int_cols:
+                ci = self._col_idx.get(f'user_int_feats_{fid}')
+                self._typed_missing_indicator_plan.append(
+                    ('user_int', ci, dim, vs, out_offset))
+                out_offset += INT_TYPED_MISSING_FEATURES_PER_SPEC
+            for fid, vs, dim in self._item_int_cols:
+                ci = self._col_idx.get(f'item_int_feats_{fid}')
+                self._typed_missing_indicator_plan.append(
+                    ('item_int', ci, dim, vs, out_offset))
+                out_offset += INT_TYPED_MISSING_FEATURES_PER_SPEC
+            for fid, dim in self._user_dense_cols:
+                ci = self._col_idx.get(f'user_dense_feats_{fid}')
+                self._typed_missing_indicator_plan.append(
+                    ('user_dense', ci, dim, 0, out_offset))
+                out_offset += DENSE_TYPED_MISSING_FEATURES_PER_SPEC
+
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
         for domain in self.seq_domains:
@@ -395,6 +533,18 @@ class PCVRParquetDataset(IterableDataset):
         for fid, vs, dim in self._user_int_cols:
             self.user_int_schema.add(fid, dim)
             self.user_int_vocab_sizes.extend([vs] * dim)
+        self._calendar_bucket_plan: List[Tuple[str, int, int]] = []
+        if self.use_calendar_bucket_features:
+            for name, fid, vocab_size in CALENDAR_BUCKET_FEATURES:
+                offset = self.user_int_schema.total_dim
+                self.user_int_schema.add(fid, 1)
+                self.user_int_vocab_sizes.append(vocab_size)
+                self._calendar_bucket_plan.append((name, offset, vocab_size))
+            logging.info(
+                "Calendar bucket features enabled: %d user_int fids %s",
+                len(CALENDAR_BUCKET_FEATURES),
+                [name for name, _, _ in CALENDAR_BUCKET_FEATURES],
+            )
 
         # ---- item_int ----
         self._item_int_cols: List[List[int]] = raw['item_int']
@@ -414,11 +564,82 @@ class PCVRParquetDataset(IterableDataset):
             for i, _ in enumerate(self._pair_feature_specs):
                 self.user_dense_schema.add(
                     PAIR_FEATURE_ID_BASE + i,
-                    PAIR_FEATURES_PER_SPEC,
+                    self._pair_features_per_spec,
                 )
         self._pair_feature_dim = (
-            len(self._pair_feature_specs) * PAIR_FEATURES_PER_SPEC
+            len(self._pair_feature_specs) * self._pair_features_per_spec
         )
+        self._calendar_time_feature_offset = self.user_dense_schema.total_dim
+        self._calendar_time_feature_dim = (
+            CALENDAR_TIME_FEATURE_DIM if self.use_calendar_time_features else 0
+        )
+        if self.use_calendar_time_features:
+            self.user_dense_schema.add(
+                CALENDAR_TIME_FEATURE_ID,
+                CALENDAR_TIME_FEATURE_DIM,
+            )
+            logging.info(
+                "Calendar time features enabled: +%d dims "
+                "(day sin/cos, weekday sin/cos, month-day sin/cos, weekend)",
+                CALENDAR_TIME_FEATURE_DIM)
+
+        self._missing_indicator_offset = self.user_dense_schema.total_dim
+        self._missing_indicator_dim = (
+            len(self._user_int_cols) + len(self._item_int_cols) + len(self._user_dense_cols)
+            if self.use_missing_indicator_features else 0
+        )
+        if self.use_missing_indicator_features:
+            self.user_dense_schema.add(
+                MISSING_INDICATOR_FEATURE_ID,
+                self._missing_indicator_dim,
+            )
+            logging.info(
+                "Missing indicator features enabled: user_int=%d, item_int=%d, "
+                "user_dense=%d, +%d dense dims",
+                len(self._user_int_cols),
+                len(self._item_int_cols),
+                len(self._user_dense_cols),
+                self._missing_indicator_dim)
+
+        self._typed_missing_indicator_offset = self.user_dense_schema.total_dim
+        self._typed_missing_indicator_dim = 0
+        if self.use_typed_missing_indicator_features:
+            self._typed_missing_int_dim = (
+                (len(self._user_int_cols) + len(self._item_int_cols))
+                * INT_TYPED_MISSING_FEATURES_PER_SPEC
+            )
+            self._typed_missing_dense_dim = (
+                len(self._user_dense_cols) * DENSE_TYPED_MISSING_FEATURES_PER_SPEC
+            )
+            self._typed_missing_summary_offset = (
+                self._typed_missing_indicator_offset
+                + self._typed_missing_int_dim
+                + self._typed_missing_dense_dim
+            )
+            self._typed_missing_indicator_dim = (
+                self._typed_missing_int_dim
+                + self._typed_missing_dense_dim
+                + TYPED_MISSING_SUMMARY_DIM
+            )
+            self.user_dense_schema.add(
+                TYPED_MISSING_INDICATOR_FEATURE_ID,
+                self._typed_missing_indicator_dim,
+            )
+            logging.info(
+                "Typed missing indicator features enabled: user_int=%d x%d, "
+                "item_int=%d x%d, user_dense=%d x%d, summary=%d, +%d dense dims",
+                len(self._user_int_cols),
+                INT_TYPED_MISSING_FEATURES_PER_SPEC,
+                len(self._item_int_cols),
+                INT_TYPED_MISSING_FEATURES_PER_SPEC,
+                len(self._user_dense_cols),
+                DENSE_TYPED_MISSING_FEATURES_PER_SPEC,
+                TYPED_MISSING_SUMMARY_DIM,
+                self._typed_missing_indicator_dim)
+        if self.use_missing_sparse_buckets:
+            logging.info(
+                "Missing sparse buckets enabled: raw missing/invalid "
+                "non-sequence int ids use per-feature bucket id=vocab_size")
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -453,6 +674,62 @@ class PCVRParquetDataset(IterableDataset):
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
+        self._seq_time_bucket_plan: Dict[str, Dict[str, Tuple[int, int]]] = {}
+        if self.use_seq_time_bucket_features:
+            for domain_idx, domain in enumerate(self.seq_domains):
+                domain_plan: Dict[str, Tuple[int, int]] = {}
+                for feature_idx, (name, vocab_size) in enumerate(SEQ_TIME_BUCKET_FEATURES):
+                    fid = (
+                        SEQ_TIME_BUCKET_FEATURE_ID_BASE
+                        + domain_idx * len(SEQ_TIME_BUCKET_FEATURES)
+                        + feature_idx
+                    )
+                    offset = self.user_int_schema.total_dim
+                    self.user_int_schema.add(fid, 1)
+                    self.user_int_vocab_sizes.append(vocab_size)
+                    domain_plan[name] = (offset, vocab_size)
+                self._seq_time_bucket_plan[domain] = domain_plan
+            logging.info(
+                "Sequence time bucket features enabled: %d domains x %d fids = +%d user_int fids",
+                len(self.seq_domains),
+                len(SEQ_TIME_BUCKET_FEATURES),
+                len(self.seq_domains) * len(SEQ_TIME_BUCKET_FEATURES),
+            )
+
+        self._seq_time_feature_offset = self.user_dense_schema.total_dim
+        self._seq_time_feature_dim = (
+            len(self.seq_domains) * SEQ_TIME_FEATURES_PER_DOMAIN
+            if self.use_seq_time_features else 0
+        )
+        if self.use_seq_time_features:
+            for i, domain in enumerate(self.seq_domains):
+                self.user_dense_schema.add(
+                    SEQ_TIME_FEATURE_ID_BASE + i,
+                    SEQ_TIME_FEATURES_PER_DOMAIN,
+                )
+            logging.info(
+                "Sequence time features enabled: %d domains x %d dims = +%d dims",
+                len(self.seq_domains),
+                SEQ_TIME_FEATURES_PER_DOMAIN,
+                self._seq_time_feature_dim)
+
+        self._seq_trunc_feature_offset = self.user_dense_schema.total_dim
+        self._seq_trunc_feature_dim = (
+            len(self.seq_domains) * SEQ_TRUNC_FEATURES_PER_DOMAIN
+            if self.use_seq_trunc_features else 0
+        )
+        if self.use_seq_trunc_features:
+            for i, domain in enumerate(self.seq_domains):
+                self.user_dense_schema.add(
+                    SEQ_TRUNC_FEATURE_ID_BASE + i,
+                    SEQ_TRUNC_FEATURES_PER_DOMAIN,
+                )
+            logging.info(
+                "Sequence truncation features enabled: %d domains x %d dims = +%d dims",
+                len(self.seq_domains),
+                SEQ_TRUNC_FEATURES_PER_DOMAIN,
+                self._seq_trunc_feature_dim)
+
     def _build_pair_feature_plan(self) -> None:
         """Resolve pair feature specs to item offsets and sequence slots."""
         self._pair_feature_plan: List[Tuple[int, str, int, int, int, int, int]] = []
@@ -470,7 +747,7 @@ class PCVRParquetDataset(IterableDataset):
 
         active = 0
         for i, (item_fid, domain, seq_fid) in enumerate(self._pair_feature_specs):
-            out_offset = self._pair_feature_start_offset + i * PAIR_FEATURES_PER_SPEC
+            out_offset = self._pair_feature_start_offset + i * self._pair_features_per_spec
             item_entry = item_lookup.get(item_fid)
             seq_slot = seq_slot_lookup.get(domain, {}).get(seq_fid)
             if item_entry is None or seq_slot is None:
@@ -486,8 +763,290 @@ class PCVRParquetDataset(IterableDataset):
             active += 1
 
         logging.info(
-            "Pair dense features enabled: %d specs, %d active, +%d dims",
-            len(self._pair_feature_specs), active, self._pair_feature_dim)
+            "Pair dense features enabled: %d specs, %d active, %d dims/spec, +%d dims%s",
+            len(self._pair_feature_specs),
+            active,
+            self._pair_features_per_spec,
+            self._pair_feature_dim,
+            f", time_windows={PAIR_TIME_WINDOWS_SECONDS}"
+            if self.use_pair_time_features else "")
+
+    def _fill_calendar_time_features(
+        self,
+        user_dense: "npt.NDArray[np.float32]",
+        timestamps: "npt.NDArray[np.int64]",
+    ) -> None:
+        """Append cyclic sample timestamp features in Beijing time."""
+        if not self.use_calendar_time_features:
+            return
+
+        out = user_dense[:, self._calendar_time_feature_offset:
+                         self._calendar_time_feature_offset + CALENDAR_TIME_FEATURE_DIM]
+        local_ts = timestamps.astype(np.int64) + LOCAL_TIME_OFFSET_SECONDS
+        seconds_in_day = np.mod(local_ts, 86400).astype(np.float32)
+        day_phase = (2.0 * np.pi * seconds_in_day) / 86400.0
+
+        day_index = np.floor_divide(local_ts, 86400)
+        weekday = np.mod(day_index + 3, 7).astype(np.float32)
+        week_phase = (2.0 * np.pi * weekday) / 7.0
+
+        local_days = (
+            timestamps.astype('datetime64[s]') + np.timedelta64(LOCAL_TIME_OFFSET_SECONDS, 's')
+        ).astype('datetime64[D]')
+        local_months = local_days.astype('datetime64[M]')
+        month_day = (local_days - local_months).astype(np.int64).astype(np.float32)
+        month_phase = (2.0 * np.pi * month_day) / 31.0
+
+        out[:, 0] = np.sin(day_phase).astype(np.float32)
+        out[:, 1] = np.cos(day_phase).astype(np.float32)
+        out[:, 2] = np.sin(week_phase).astype(np.float32)
+        out[:, 3] = np.cos(week_phase).astype(np.float32)
+        out[:, 4] = np.sin(month_phase).astype(np.float32)
+        out[:, 5] = np.cos(month_phase).astype(np.float32)
+        out[:, 6] = (weekday >= 5).astype(np.float32)
+
+    def _fill_calendar_bucket_features(
+        self,
+        user_int: "npt.NDArray[np.int64]",
+        timestamps: "npt.NDArray[np.int64]",
+    ) -> None:
+        """Append low-cardinality sample timestamp bucket ids in Beijing time."""
+        if not self.use_calendar_bucket_features:
+            return
+
+        local_ts = timestamps.astype(np.int64) + LOCAL_TIME_OFFSET_SECONDS
+        seconds_in_day = np.mod(local_ts, 86400)
+        hour = np.floor_divide(seconds_in_day, 3600).astype(np.int64)
+        ten_minute = np.floor_divide(seconds_in_day, 600).astype(np.int64)
+
+        day_index = np.floor_divide(local_ts, 86400)
+        weekday = np.mod(day_index + 3, 7).astype(np.int64)
+        hour_weekday = weekday * 24 + hour
+
+        values = {
+            'hour': hour + 1,
+            'weekday': weekday + 1,
+            'hour_weekday': hour_weekday + 1,
+            'ten_minute': ten_minute + 1,
+        }
+        for name, offset, vocab_size in self._calendar_bucket_plan:
+            vals = values[name]
+            vals = np.clip(vals, 0, vocab_size).astype(np.int64)
+            user_int[:, offset] = vals
+
+    def _fill_seq_time_bucket_features(
+        self,
+        user_int: "npt.NDArray[np.int64]",
+        seq_timestamps: Dict[str, "npt.NDArray[np.int64]"],
+        seq_lengths: Dict[str, "npt.NDArray[np.int64]"],
+        seq_full_time_stats: Dict[str, Dict[str, "npt.NDArray[np.int64]"]],
+        timestamps: "npt.NDArray[np.int64]",
+    ) -> None:
+        """Append per-domain sequence time summary bucket ids."""
+        if not self.use_seq_time_bucket_features:
+            return
+
+        for domain in self.seq_domains:
+            plan = self._seq_time_bucket_plan.get(domain)
+            if not plan:
+                continue
+
+            ts_matrix = seq_timestamps.get(domain)
+            lengths = seq_lengths.get(domain)
+            stats = seq_full_time_stats.get(domain)
+
+            if ts_matrix is not None:
+                valid = ts_matrix > 0
+                retained_max_ts = np.where(valid, ts_matrix, 0).max(axis=1)
+                has_retained_ts = retained_max_ts > 0
+                recency = np.zeros_like(timestamps, dtype=np.int64)
+                recency[has_retained_ts] = np.maximum(
+                    timestamps[has_retained_ts] - retained_max_ts[has_retained_ts],
+                    0,
+                )
+                offset, _ = plan['last_recency']
+                user_int[:, offset] = _bucketize_with_padding(
+                    recency,
+                    BUCKET_BOUNDARIES,
+                    has_retained_ts,
+                )
+
+            if stats:
+                full_min = stats['full_min']
+                full_max = stats['full_max']
+                has_full_ts = (full_min > 0) & (full_max > 0) & (full_max >= full_min)
+                full_span = np.zeros_like(timestamps, dtype=np.int64)
+                full_span[has_full_ts] = full_max[has_full_ts] - full_min[has_full_ts]
+                offset, _ = plan['full_span']
+                user_int[:, offset] = _bucketize_with_padding(
+                    full_span,
+                    BUCKET_BOUNDARIES,
+                    has_full_ts,
+                )
+
+            if lengths is not None:
+                valid_len = lengths.astype(np.int64)
+                offset, _ = plan['valid_len']
+                user_int[:, offset] = _bucketize_with_padding(
+                    valid_len,
+                    SEQ_LEN_BUCKET_BOUNDARIES,
+                    valid_len > 0,
+                )
+
+    def _fill_seq_time_features(
+        self,
+        user_dense: "npt.NDArray[np.float32]",
+        seq_timestamps: Dict[str, "npt.NDArray[np.int64]"],
+        timestamps: "npt.NDArray[np.int64]",
+    ) -> None:
+        """Append per-domain sequence timestamp summary features."""
+        if not self.use_seq_time_features:
+            return
+
+        row_timestamps = timestamps.reshape(-1, 1)
+        log_cap = np.log1p(PAIR_RECENCY_CAP_SECONDS)
+        eps = 1e-6
+
+        for domain_idx, domain in enumerate(self.seq_domains):
+            ts_matrix = seq_timestamps.get(domain)
+            if ts_matrix is None:
+                continue
+
+            out_offset = (
+                self._seq_time_feature_offset
+                + domain_idx * SEQ_TIME_FEATURES_PER_DOMAIN
+            )
+            out = user_dense[:, out_offset:out_offset + SEQ_TIME_FEATURES_PER_DOMAIN]
+
+            valid = ts_matrix > 0
+            counts = valid.sum(axis=1).astype(np.float32)
+            has_valid = counts > 0
+
+            age = np.where(
+                valid,
+                np.maximum(row_timestamps - ts_matrix, 0),
+                PAIR_RECENCY_CAP_SECONDS,
+            ).astype(np.float32)
+            min_age = age.min(axis=1)
+            recency = 1.0 - np.minimum(np.log1p(min_age) / log_cap, 1.0)
+            recency[~has_valid] = 0.0
+
+            valid_ts_for_max = np.where(valid, ts_matrix, 0)
+            valid_ts_for_min = np.where(valid, ts_matrix, np.iinfo(np.int64).max)
+            max_ts = valid_ts_for_max.max(axis=1)
+            min_ts = valid_ts_for_min.min(axis=1)
+            span = np.zeros_like(counts, dtype=np.float32)
+            has_span = counts > 1
+            span[has_span] = np.maximum(
+                max_ts[has_span] - min_ts[has_span],
+                0,
+            ).astype(np.float32)
+            span_norm = np.minimum(np.log1p(span) / log_cap, 1.0)
+
+            age_sum = np.where(valid, age, 0.0).sum(axis=1)
+            avg_age = np.divide(
+                age_sum,
+                np.maximum(counts, 1.0),
+                out=np.full_like(age_sum, PAIR_RECENCY_CAP_SECONDS),
+                where=counts > 0,
+            )
+            avg_recency = 1.0 - np.minimum(np.log1p(avg_age) / log_cap, 1.0)
+            avg_recency[~has_valid] = 0.0
+
+            max_len = max(1, self._seq_maxlen[domain])
+            out[:, 0] = (
+                np.log1p(counts) / np.log1p(float(max_len))
+            ).astype(np.float32)
+            out[:, 1] = recency.astype(np.float32)
+            out[:, 2] = span_norm.astype(np.float32)
+            out[:, 3] = avg_recency.astype(np.float32)
+
+            for j, window in enumerate(SEQ_TIME_RECENT_WINDOWS):
+                recent = valid & (age <= float(window))
+                ratio = np.divide(
+                    recent.sum(axis=1).astype(np.float32),
+                    np.maximum(counts, 1.0),
+                    out=np.zeros_like(counts),
+                    where=counts > eps,
+                )
+                out[:, 4 + j] = ratio.astype(np.float32)
+
+    def _fill_seq_trunc_features(
+        self,
+        user_dense: "npt.NDArray[np.float32]",
+        seq_raw_lengths: Dict[str, "npt.NDArray[np.int64]"],
+        seq_full_time_stats: Dict[str, Dict[str, "npt.NDArray[np.int64]"]],
+    ) -> None:
+        """Append per-domain raw-length and truncation summary features."""
+        if not self.use_seq_trunc_features:
+            return
+
+        log_time_cap = np.log1p(PAIR_RECENCY_CAP_SECONDS)
+
+        for domain_idx, domain in enumerate(self.seq_domains):
+            raw_lengths = seq_raw_lengths.get(domain)
+            if raw_lengths is None:
+                continue
+
+            out_offset = (
+                self._seq_trunc_feature_offset
+                + domain_idx * SEQ_TRUNC_FEATURES_PER_DOMAIN
+            )
+            out = user_dense[:, out_offset:out_offset + SEQ_TRUNC_FEATURES_PER_DOMAIN]
+
+            max_len = max(1, self._seq_maxlen[domain])
+            len_cap = float(max(max_len * SEQ_TRUNC_LEN_CAP_MULT, max_len + 1))
+            raw = raw_lengths.astype(np.float32)
+            overflow = np.maximum(raw - float(max_len), 0.0)
+
+            out[:, 0] = np.minimum(
+                np.log1p(raw) / np.log1p(len_cap),
+                1.0,
+            ).astype(np.float32)
+            out[:, 1] = (overflow > 0).astype(np.float32)
+            out[:, 2] = np.divide(
+                overflow,
+                np.maximum(raw, 1.0),
+                out=np.zeros_like(raw),
+                where=raw > 0,
+            ).astype(np.float32)
+            out[:, 3] = np.minimum(
+                np.log1p(overflow) / np.log1p(len_cap),
+                1.0,
+            ).astype(np.float32)
+
+            stats = seq_full_time_stats.get(domain)
+            if not stats:
+                continue
+
+            full_min = stats['full_min']
+            full_max = stats['full_max']
+            retained_min = stats['retained_min']
+            has_full_span = (full_min > 0) & (full_max > 0) & (full_max >= full_min)
+
+            full_span = np.zeros_like(raw, dtype=np.float32)
+            full_span[has_full_span] = (
+                full_max[has_full_span] - full_min[has_full_span]
+            ).astype(np.float32)
+            out[:, 4] = np.minimum(
+                np.log1p(full_span) / log_time_cap,
+                1.0,
+            ).astype(np.float32)
+
+            has_tail_gap = (
+                (overflow > 0)
+                & (retained_min > 0)
+                & (full_min > 0)
+                & (retained_min >= full_min)
+            )
+            tail_gap = np.zeros_like(raw, dtype=np.float32)
+            tail_gap[has_tail_gap] = (
+                retained_min[has_tail_gap] - full_min[has_tail_gap]
+            ).astype(np.float32)
+            out[:, 5] = np.minimum(
+                np.log1p(tail_gap) / log_time_cap,
+                1.0,
+            ).astype(np.float32)
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -607,11 +1166,15 @@ class PCVRParquetDataset(IterableDataset):
         arrow_col: "pa.ListArray",
         max_len: int,
         B: int,
+        invalid_bucket_id: Optional[int] = None,
+        vocab_size: int = 0,
     ) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
         """Pad an Arrow ``ListArray`` of ints to shape ``[B, max_len]``.
 
-        Values <= 0 are mapped to 0 (padding). Note: the raw data contains -1
-        (missing); currently treated the same way as 0 (padding).
+        Values <= 0 are mapped to 0 by default. When ``invalid_bucket_id`` is
+        provided, raw missing/invalid values that were actually present in the
+        source list are mapped to that learned bucket instead. Natural padding
+        positions created by shorter lists remain 0.
 
         Returns:
             A tuple ``(padded, lengths)`` where ``padded`` has shape
@@ -627,18 +1190,54 @@ class PCVRParquetDataset(IterableDataset):
             start, end = int(offsets[i]), int(offsets[i + 1])
             raw_len = end - start
             if raw_len <= 0:
+                if invalid_bucket_id is not None and max_len > 0:
+                    padded[i, 0] = invalid_bucket_id
+                    lengths[i] = 1
                 continue
             use_len = min(raw_len, max_len)
-            padded[i, :use_len] = values[start:start + use_len]
+            row = values[start:start + use_len]
+            if invalid_bucket_id is not None:
+                row = row.astype(np.int64, copy=True)
+                invalid = row <= 0
+                if vocab_size > 0:
+                    invalid |= row >= vocab_size
+                else:
+                    invalid |= row != 0
+                row[invalid] = invalid_bucket_id
+            padded[i, :use_len] = row
             lengths[i] = use_len
 
-        padded[padded <= 0] = 0
+        if invalid_bucket_id is None:
+            padded[padded <= 0] = 0
         return padded, lengths
 
     # Backwards-compatible alias kept for bench_raw_dataset.py and other
     # external callers that pre-date the rename. New code should call
     # `_pad_varlen_int_column` directly.
     _pad_varlen_column = _pad_varlen_int_column
+
+    def _map_scalar_int_column(
+        self,
+        arrow_col: Any,
+        vocab_size: int,
+        group: str,
+        col_idx: int,
+    ) -> "npt.NDArray[np.int64]":
+        """Map a scalar int feature, optionally preserving invalid as a bucket."""
+        arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+        if vocab_size <= 0:
+            arr[:] = 0
+            return arr
+
+        if self.use_missing_sparse_buckets:
+            invalid = arr <= 0
+            invalid |= arr >= vocab_size
+            arr[invalid] = vocab_size
+            return arr
+
+        arr[arr <= 0] = 0
+        self._record_oob(group, col_idx, arr, vocab_size)
+        return arr
 
     def _pad_varlen_float_column(
         self,
@@ -661,6 +1260,237 @@ class PCVRParquetDataset(IterableDataset):
             padded[i, :use_len] = values[start:start + use_len]
 
         return padded
+
+    def _int_missing_or_invalid_mask(
+        self,
+        arrow_col: Any,
+        dim: int,
+        B: int,
+        vocab_size: int,
+    ) -> "npt.NDArray[np.bool_]":
+        """Return rows whose raw int feature is missing or mapped to padding."""
+        null_mask = np.asarray(
+            arrow_col.is_null().to_numpy(zero_copy_only=False),
+            dtype=bool,
+        )
+        invalid = null_mask.copy()
+
+        if dim == 1:
+            arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+            invalid |= arr <= 0
+            if vocab_size > 0:
+                invalid |= arr >= vocab_size
+            else:
+                invalid |= arr != 0
+            return invalid
+
+        offsets = arrow_col.offsets.to_numpy()
+        values = arrow_col.values.to_numpy()
+        for i in range(B):
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                invalid[i] = True
+                continue
+            if raw_len < dim:
+                invalid[i] = True
+            row = values[start:end]
+            row_invalid = row <= 0
+            if vocab_size > 0:
+                row_invalid = row_invalid | (row >= vocab_size)
+            else:
+                row_invalid = np.ones_like(row, dtype=bool)
+            if row_invalid.any():
+                invalid[i] = True
+        return invalid
+
+    def _dense_missing_mask(
+        self,
+        arrow_col: Any,
+        B: int,
+        dim: int,
+    ) -> "npt.NDArray[np.bool_]":
+        """Return rows whose raw dense feature is null or shorter than schema."""
+        invalid = np.asarray(
+            arrow_col.is_null().to_numpy(zero_copy_only=False),
+            dtype=bool,
+        )
+        if hasattr(arrow_col, 'offsets'):
+            offsets = arrow_col.offsets.to_numpy()
+            invalid |= (offsets[1:] - offsets[:-1]) < dim
+        return invalid
+
+    def _int_typed_missing_masks(
+        self,
+        arrow_col: Any,
+        dim: int,
+        B: int,
+        vocab_size: int,
+    ) -> Tuple["npt.NDArray[np.bool_]", "npt.NDArray[np.bool_]", "npt.NDArray[np.bool_]"]:
+        """Split raw int invalid states into absent/short, non-positive, OOB."""
+        null_mask = np.asarray(
+            arrow_col.is_null().to_numpy(zero_copy_only=False),
+            dtype=bool,
+        )
+        absent = null_mask.copy()
+        nonpositive = np.zeros(B, dtype=bool)
+        oob = np.zeros(B, dtype=bool)
+
+        if dim == 1:
+            arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+            present = ~null_mask
+            nonpositive |= present & (arr <= 0)
+            if vocab_size > 0:
+                oob |= present & (arr >= vocab_size)
+            return absent, nonpositive, oob
+
+        offsets = arrow_col.offsets.to_numpy()
+        values = arrow_col.values.to_numpy()
+        for i in range(B):
+            if null_mask[i]:
+                continue
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                absent[i] = True
+                continue
+            if raw_len < dim:
+                absent[i] = True
+            row = values[start:end]
+            nonpositive[i] = bool((row <= 0).any())
+            if vocab_size > 0:
+                oob[i] = bool((row >= vocab_size).any())
+        return absent, nonpositive, oob
+
+    def _dense_typed_missing_masks(
+        self,
+        arrow_col: Any,
+        B: int,
+        dim: int,
+    ) -> Tuple["npt.NDArray[np.bool_]", "npt.NDArray[np.bool_]"]:
+        """Split raw dense invalid states into absent/short and zero-like."""
+        null_mask = np.asarray(
+            arrow_col.is_null().to_numpy(zero_copy_only=False),
+            dtype=bool,
+        )
+        absent = null_mask.copy()
+        zero_like = np.zeros(B, dtype=bool)
+
+        if hasattr(arrow_col, 'offsets'):
+            offsets = arrow_col.offsets.to_numpy()
+            values = arrow_col.values.to_numpy()
+            for i in range(B):
+                if null_mask[i]:
+                    continue
+                start, end = int(offsets[i]), int(offsets[i + 1])
+                raw_len = end - start
+                if raw_len <= 0:
+                    absent[i] = True
+                    continue
+                if raw_len < dim:
+                    absent[i] = True
+                row = values[start:min(end, start + dim)]
+                zero_like[i] = bool(np.all(np.abs(row) <= 1e-8))
+            return absent, zero_like
+
+        arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.float32)
+        present = ~null_mask
+        zero_like |= present & (np.abs(arr) <= 1e-8)
+        return absent, zero_like
+
+    def _fill_missing_indicator_features(
+        self,
+        user_dense: "npt.NDArray[np.float32]",
+        batch: "pa.RecordBatch",
+        B: int,
+    ) -> None:
+        """Append binary flags for raw non-sequence missing/invalid values."""
+        if not self.use_missing_indicator_features:
+            return
+
+        out = user_dense[:, self._missing_indicator_offset:
+                         self._missing_indicator_offset + self._missing_indicator_dim]
+        out[:] = 0.0
+        for kind, ci, dim, vocab_size, out_offset in self._missing_indicator_plan:
+            if ci is None:
+                user_dense[:, out_offset] = 1.0
+                continue
+            col = batch.column(ci)
+            if kind == 'int':
+                mask = self._int_missing_or_invalid_mask(col, dim, B, vocab_size)
+            else:
+                mask = self._dense_missing_mask(col, B, dim)
+            user_dense[:, out_offset] = mask.astype(np.float32)
+
+    def _fill_typed_missing_indicator_features(
+        self,
+        user_dense: "npt.NDArray[np.float32]",
+        batch: "pa.RecordBatch",
+        B: int,
+    ) -> None:
+        """Append typed missing flags plus compact side-level ratios."""
+        if not self.use_typed_missing_indicator_features:
+            return
+
+        out = user_dense[:, self._typed_missing_indicator_offset:
+                         self._typed_missing_indicator_offset
+                         + self._typed_missing_indicator_dim]
+        out[:] = 0.0
+        summary = np.zeros((B, TYPED_MISSING_SUMMARY_DIM), dtype=np.float32)
+
+        for kind, ci, dim, vocab_size, out_offset in self._typed_missing_indicator_plan:
+            if ci is None:
+                if kind == 'user_dense':
+                    absent = np.ones(B, dtype=bool)
+                    zero_like = np.zeros(B, dtype=bool)
+                    user_dense[:, out_offset] = 1.0
+                    user_dense[:, out_offset + 1] = 0.0
+                    summary[:, 6] += absent.astype(np.float32)
+                    summary[:, 7] += zero_like.astype(np.float32)
+                else:
+                    absent = np.ones(B, dtype=bool)
+                    nonpositive = np.zeros(B, dtype=bool)
+                    oob = np.zeros(B, dtype=bool)
+                    user_dense[:, out_offset] = 1.0
+                    user_dense[:, out_offset + 1] = 0.0
+                    user_dense[:, out_offset + 2] = 0.0
+                    base = 0 if kind == 'user_int' else 3
+                    summary[:, base] += absent.astype(np.float32)
+                    summary[:, base + 1] += nonpositive.astype(np.float32)
+                    summary[:, base + 2] += oob.astype(np.float32)
+                continue
+
+            col = batch.column(ci)
+            if kind in ('user_int', 'item_int'):
+                absent, nonpositive, oob = self._int_typed_missing_masks(
+                    col, dim, B, vocab_size)
+                user_dense[:, out_offset] = absent.astype(np.float32)
+                user_dense[:, out_offset + 1] = nonpositive.astype(np.float32)
+                user_dense[:, out_offset + 2] = oob.astype(np.float32)
+                base = 0 if kind == 'user_int' else 3
+                summary[:, base] += absent.astype(np.float32)
+                summary[:, base + 1] += nonpositive.astype(np.float32)
+                summary[:, base + 2] += oob.astype(np.float32)
+            else:
+                absent, zero_like = self._dense_typed_missing_masks(col, B, dim)
+                user_dense[:, out_offset] = absent.astype(np.float32)
+                user_dense[:, out_offset + 1] = zero_like.astype(np.float32)
+                summary[:, 6] += absent.astype(np.float32)
+                summary[:, 7] += zero_like.astype(np.float32)
+
+        denom = np.array([
+            max(len(self._user_int_cols), 1),
+            max(len(self._user_int_cols), 1),
+            max(len(self._user_int_cols), 1),
+            max(len(self._item_int_cols), 1),
+            max(len(self._item_int_cols), 1),
+            max(len(self._item_int_cols), 1),
+            max(len(self._user_dense_cols), 1),
+            max(len(self._user_dense_cols), 1),
+        ], dtype=np.float32)
+        summary /= denom.reshape(1, -1)
+        user_dense[:, self._typed_missing_summary_offset:
+                   self._typed_missing_summary_offset + TYPED_MISSING_SUMMARY_DIM] = summary
 
     def _fill_pair_features(
         self,
@@ -732,6 +1562,14 @@ class PCVRParquetDataset(IterableDataset):
             recency[counts <= 0] = 0.0
             user_dense[:, out_offset + 2] = recency.astype(np.float32)
 
+            if self.use_pair_time_features:
+                time_out_offset = out_offset + PAIR_FEATURES_PER_SPEC
+                for j, window in enumerate(PAIR_TIME_WINDOWS_SECONDS):
+                    user_dense[:, time_out_offset + j] = (
+                        valid_match_ts
+                        & (deltas <= float(window))
+                    ).any(axis=1).astype(np.float32)
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -746,30 +1584,34 @@ class PCVRParquetDataset(IterableDataset):
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
         # ---- user_int: write into pre-allocated buffer ----
-        # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
-        # are treated the same as padding. Features with vs==0 have no vocab
-        # information and are forced to 0 on the dataset side so that the
-        # model's 1-slot Embedding (created for vs=0) is never indexed out of
-        # range.
+        # By default null / <=0 / OOB values are mapped to padding 0. When
+        # sparse missing buckets are enabled, raw invalid values use the
+        # per-feature spare index ``vocab_size``; naturally padded list slots
+        # remain 0 so multi-value mean pooling is not polluted by padding.
         user_int = self._buf_user_int[:B]
         user_int[:] = 0
         for ci, dim, offset, vs in self._user_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
-                arr[arr <= 0] = 0
-                if vs > 0:
-                    self._record_oob('user_int', ci, arr, vs)
-                else:
-                    arr[:] = 0
+                arr = self._map_scalar_int_column(
+                    col, vs, group='user_int', col_idx=ci)
                 user_int[:, offset] = arr
             else:
-                padded, _ = self._pad_varlen_int_column(col, dim, B)
-                if vs > 0:
-                    self._record_oob('user_int', ci, padded, vs)
+                if self.use_missing_sparse_buckets and vs > 0:
+                    padded, _ = self._pad_varlen_int_column(
+                        col, dim, B, invalid_bucket_id=vs, vocab_size=vs)
                 else:
+                    padded, _ = self._pad_varlen_int_column(col, dim, B)
+                if vs > 0 and not self.use_missing_sparse_buckets:
+                    self._record_oob('user_int', ci, padded, vs)
+                elif vs <= 0:
                     padded[:] = 0
                 user_int[:, offset:offset + dim] = padded
+        if self.use_calendar_bucket_features:
+            self._fill_calendar_bucket_features(
+                user_int=user_int,
+                timestamps=timestamps,
+            )
 
         # ---- item_int ----
         item_int = self._buf_item_int[:B]
@@ -777,18 +1619,18 @@ class PCVRParquetDataset(IterableDataset):
         for ci, dim, offset, vs in self._item_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
-                arr[arr <= 0] = 0
-                if vs > 0:
-                    self._record_oob('item_int', ci, arr, vs)
-                else:
-                    arr[:] = 0
+                arr = self._map_scalar_int_column(
+                    col, vs, group='item_int', col_idx=ci)
                 item_int[:, offset] = arr
             else:
-                padded, _ = self._pad_varlen_int_column(col, dim, B)
-                if vs > 0:
-                    self._record_oob('item_int', ci, padded, vs)
+                if self.use_missing_sparse_buckets and vs > 0:
+                    padded, _ = self._pad_varlen_int_column(
+                        col, dim, B, invalid_bucket_id=vs, vocab_size=vs)
                 else:
+                    padded, _ = self._pad_varlen_int_column(col, dim, B)
+                if vs > 0 and not self.use_missing_sparse_buckets:
+                    self._record_oob('item_int', ci, padded, vs)
+                elif vs <= 0:
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
 
@@ -799,6 +1641,18 @@ class PCVRParquetDataset(IterableDataset):
             col = batch.column(ci)
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
+        if self.use_missing_indicator_features:
+            self._fill_missing_indicator_features(
+                user_dense=user_dense,
+                batch=batch,
+                B=B,
+            )
+        if self.use_typed_missing_indicator_features:
+            self._fill_typed_missing_indicator_features(
+                user_dense=user_dense,
+                batch=batch,
+                B=B,
+            )
 
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
@@ -813,6 +1667,9 @@ class PCVRParquetDataset(IterableDataset):
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         seq_values: Dict[str, "npt.NDArray[np.int64]"] = {}
         seq_timestamps: Dict[str, "npt.NDArray[np.int64]"] = {}
+        seq_lengths: Dict[str, "npt.NDArray[np.int64]"] = {}
+        seq_raw_lengths: Dict[str, "npt.NDArray[np.int64]"] = {}
+        seq_full_time_stats: Dict[str, Dict[str, "npt.NDArray[np.int64]"]] = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
@@ -822,6 +1679,7 @@ class PCVRParquetDataset(IterableDataset):
             out[:] = 0
             lengths = self._buf_seq_lens[domain][:B]
             lengths[:] = 0
+            raw_lengths = np.zeros(B, dtype=np.int64)
 
             # Fused path: first collect (offsets, values, vocab_size, col_idx)
             # for every side-info column, then fill the buffer in a single pass.
@@ -837,6 +1695,8 @@ class PCVRParquetDataset(IterableDataset):
                     rl = e - s
                     if rl <= 0:
                         continue
+                    if rl > raw_lengths[i]:
+                        raw_lengths[i] = rl
                     ul = min(rl, max_len)
                     out[i, c, :ul] = vals[s:s + ul]
                     if ul > lengths[i]:
@@ -863,6 +1723,9 @@ class PCVRParquetDataset(IterableDataset):
             time_bucket[:] = 0
             ts_padded = self._buf_seq_ts[domain][:B]
             ts_padded[:] = 0
+            full_min_ts = np.zeros(B, dtype=np.int64)
+            full_max_ts = np.zeros(B, dtype=np.int64)
+            retained_min_ts = np.zeros(B, dtype=np.int64)
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -874,8 +1737,19 @@ class PCVRParquetDataset(IterableDataset):
                     rl = e - s
                     if rl <= 0:
                         continue
+                    if rl > raw_lengths[i]:
+                        raw_lengths[i] = rl
                     ul = min(rl, max_len)
-                    ts_padded[i, :ul] = ts_vals[s:s + ul]
+                    raw_ts = ts_vals[s:e]
+                    valid_raw_ts = raw_ts[raw_ts > 0]
+                    if len(valid_raw_ts) > 0:
+                        full_min_ts[i] = int(valid_raw_ts.min())
+                        full_max_ts[i] = int(valid_raw_ts.max())
+                    retained_ts = ts_vals[s:s + ul]
+                    ts_padded[i, :ul] = retained_ts
+                    valid_retained_ts = retained_ts[retained_ts > 0]
+                    if len(valid_retained_ts) > 0:
+                        retained_min_ts[i] = int(valid_retained_ts.min())
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
@@ -899,6 +1773,13 @@ class PCVRParquetDataset(IterableDataset):
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             seq_values[domain] = out
             seq_timestamps[domain] = ts_padded
+            seq_lengths[domain] = lengths
+            seq_raw_lengths[domain] = raw_lengths
+            seq_full_time_stats[domain] = {
+                'full_min': full_min_ts,
+                'full_max': full_max_ts,
+                'retained_min': retained_min_ts,
+            }
 
         if self.use_pair_features:
             self._fill_pair_features(
@@ -908,6 +1789,32 @@ class PCVRParquetDataset(IterableDataset):
                 seq_timestamps=seq_timestamps,
                 timestamps=timestamps,
             )
+        if self.use_calendar_time_features:
+            self._fill_calendar_time_features(
+                user_dense=user_dense,
+                timestamps=timestamps,
+            )
+        if self.use_seq_time_bucket_features:
+            self._fill_seq_time_bucket_features(
+                user_int=user_int,
+                seq_timestamps=seq_timestamps,
+                seq_lengths=seq_lengths,
+                seq_full_time_stats=seq_full_time_stats,
+                timestamps=timestamps,
+            )
+        if self.use_seq_time_features:
+            self._fill_seq_time_features(
+                user_dense=user_dense,
+                seq_timestamps=seq_timestamps,
+                timestamps=timestamps,
+            )
+        if self.use_seq_trunc_features:
+            self._fill_seq_trunc_features(
+                user_dense=user_dense,
+                seq_raw_lengths=seq_raw_lengths,
+                seq_full_time_stats=seq_full_time_stats,
+            )
+        result['user_int_feats'] = torch.from_numpy(user_int.copy())
         result['user_dense_feats'] = torch.from_numpy(user_dense.copy())
 
         return result
@@ -929,6 +1836,15 @@ def get_pcvr_data(
     split_time_col: str = 'timestamp',
     split_time_stat: str = 'median',
     use_pair_features: bool = False,
+    use_pair_time_features: bool = False,
+    use_calendar_time_features: bool = False,
+    use_calendar_bucket_features: bool = False,
+    use_seq_time_bucket_features: bool = False,
+    use_seq_time_features: bool = False,
+    use_seq_trunc_features: bool = False,
+    use_missing_indicator_features: bool = False,
+    use_typed_missing_indicator_features: bool = False,
+    use_missing_sparse_buckets: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -998,6 +1914,15 @@ def get_pcvr_data(
         row_group_list=train_rg_info,
         clip_vocab=clip_vocab,
         use_pair_features=use_pair_features,
+        use_pair_time_features=use_pair_time_features,
+        use_calendar_time_features=use_calendar_time_features,
+        use_calendar_bucket_features=use_calendar_bucket_features,
+        use_seq_time_bucket_features=use_seq_time_bucket_features,
+        use_seq_time_features=use_seq_time_features,
+        use_seq_trunc_features=use_seq_trunc_features,
+        use_missing_indicator_features=use_missing_indicator_features,
+        use_typed_missing_indicator_features=use_typed_missing_indicator_features,
+        use_missing_sparse_buckets=use_missing_sparse_buckets,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1021,6 +1946,15 @@ def get_pcvr_data(
         row_group_list=valid_rg_info,
         clip_vocab=clip_vocab,
         use_pair_features=use_pair_features,
+        use_pair_time_features=use_pair_time_features,
+        use_calendar_time_features=use_calendar_time_features,
+        use_calendar_bucket_features=use_calendar_bucket_features,
+        use_seq_time_bucket_features=use_seq_time_bucket_features,
+        use_seq_time_features=use_seq_time_features,
+        use_seq_trunc_features=use_seq_trunc_features,
+        use_missing_indicator_features=use_missing_indicator_features,
+        use_typed_missing_indicator_features=use_typed_missing_indicator_features,
+        use_missing_sparse_buckets=use_missing_sparse_buckets,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

@@ -71,6 +71,10 @@ _FALLBACK_MODEL_CFG = {
     'item_ns_tokens': 0,
     'use_aligned_dense_int': False,
     'aligned_dense_int_tokens': 2,
+    'use_grouped_raw_dense_proj': False,
+    'use_engineered_dense_token': False,
+    'use_time_context_gate': False,
+    'use_target_din': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -337,6 +341,24 @@ def main() -> None:
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
     use_pair_features = bool(train_config.get('use_pair_features', False))
+    use_pair_time_features = bool(
+        train_config.get('use_pair_time_features', False))
+    use_calendar_time_features = bool(
+        train_config.get('use_calendar_time_features', False))
+    use_calendar_bucket_features = bool(
+        train_config.get('use_calendar_bucket_features', False))
+    use_seq_time_bucket_features = bool(
+        train_config.get('use_seq_time_bucket_features', False))
+    use_seq_time_features = bool(
+        train_config.get('use_seq_time_features', False))
+    use_seq_trunc_features = bool(
+        train_config.get('use_seq_trunc_features', False))
+    use_missing_indicator_features = bool(
+        train_config.get('use_missing_indicator_features', False))
+    use_typed_missing_indicator_features = bool(
+        train_config.get('use_typed_missing_indicator_features', False))
+    use_missing_sparse_buckets = bool(
+        train_config.get('use_missing_sparse_buckets', False))
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -347,6 +369,15 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         use_pair_features=use_pair_features,
+        use_pair_time_features=use_pair_time_features,
+        use_calendar_time_features=use_calendar_time_features,
+        use_calendar_bucket_features=use_calendar_bucket_features,
+        use_seq_time_bucket_features=use_seq_time_bucket_features,
+        use_seq_time_features=use_seq_time_features,
+        use_seq_trunc_features=use_seq_trunc_features,
+        use_missing_indicator_features=use_missing_indicator_features,
+        use_typed_missing_indicator_features=use_typed_missing_indicator_features,
+        use_missing_sparse_buckets=use_missing_sparse_buckets,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

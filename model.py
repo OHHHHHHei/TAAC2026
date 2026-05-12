@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -492,6 +492,114 @@ class MultiSeqQueryGenerator(nn.Module):
             q_tokens_list.append(q_tokens)
 
         return q_tokens_list
+
+
+class TargetDINAttention(nn.Module):
+    """Target item attention over multi-domain history sequence tokens.
+
+    This is a lightweight DIN-style side branch. It keeps the HyFormer backbone
+    unchanged, builds a target representation from item NS tokens, attends to
+    each history domain with padding-aware dot-product attention, then fuses the
+    target-aware history vector back into the final classifier representation
+    through a small gated residual.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_sequences: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_sequences = num_sequences
+
+        self.item_norm = nn.LayerNorm(d_model)
+        self.seq_norm = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+
+        self.domain_scorer = nn.Sequential(
+            nn.Linear(d_model * 4, d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+        self.context_norm = nn.LayerNorm(d_model)
+        self.context_proj = nn.Linear(d_model, d_model)
+        self.gate = nn.Linear(d_model * 3, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        # Start as a near-identity residual path so the strong existing
+        # feature/backbone signal is not disrupted early in training.
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -2.0)
+        nn.init.normal_(self.context_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.context_proj.bias)
+
+    def _attend_one_domain(
+        self,
+        target: torch.Tensor,
+        seq_tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid = ~padding_mask
+        q = self.q_proj(target).unsqueeze(1)  # (B, 1, D)
+        seq = self.seq_norm(seq_tokens)
+        k = self.k_proj(seq)
+        v = self.v_proj(seq)
+
+        scores = (q * k).sum(dim=-1) / math.sqrt(self.d_model)  # (B, L)
+        scores = scores.masked_fill(padding_mask, -1.0e4)
+        attn = torch.softmax(scores, dim=-1)
+        attn = attn * valid.to(attn.dtype)
+        denom = attn.sum(dim=-1, keepdim=True).clamp(min=1.0e-6)
+        hist = (attn.unsqueeze(-1) * v).sum(dim=1) / denom
+        has_valid = valid.any(dim=1)
+        hist = hist * has_valid.to(hist.dtype).unsqueeze(-1)
+        return hist, has_valid
+
+    def forward(
+        self,
+        output: torch.Tensor,
+        item_ns: torch.Tensor,
+        seq_tokens_list: List[torch.Tensor],
+        seq_padding_masks: List[torch.Tensor],
+    ) -> torch.Tensor:
+        item_target = self.item_norm(item_ns.mean(dim=1))  # (B, D)
+
+        domain_hists = []
+        domain_valids = []
+        for seq_tokens, padding_mask in zip(seq_tokens_list, seq_padding_masks):
+            hist, has_valid = self._attend_one_domain(
+                item_target, seq_tokens, padding_mask)
+            domain_hists.append(hist)
+            domain_valids.append(has_valid)
+
+        hists = torch.stack(domain_hists, dim=1)  # (B, S, D)
+        valid_domains = torch.stack(domain_valids, dim=1)  # (B, S)
+        target_exp = item_target.unsqueeze(1).expand_as(hists)
+        domain_input = torch.cat([
+            target_exp,
+            hists,
+            target_exp * hists,
+            (target_exp - hists).abs(),
+        ], dim=-1)
+        domain_scores = self.domain_scorer(domain_input).squeeze(-1)
+        domain_scores = domain_scores.masked_fill(~valid_domains, -1.0e4)
+        domain_weights = torch.softmax(domain_scores, dim=-1)
+        domain_weights = domain_weights * valid_domains.to(domain_weights.dtype)
+        domain_weights = domain_weights / domain_weights.sum(
+            dim=-1, keepdim=True).clamp(min=1.0e-6)
+
+        context = (domain_weights.unsqueeze(-1) * hists).sum(dim=1)
+        context = self.context_norm(context)
+        residual = self.dropout(self.context_proj(context))
+        gate = torch.sigmoid(self.gate(torch.cat([
+            output, context, item_target
+        ], dim=-1)))
+        return output + gate * residual
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1196,6 +1304,13 @@ class AlignedDenseIntTokenizer(nn.Module):
     """
 
     ALIGNED_FIDS = (62, 63, 64, 65, 66, 89, 90, 91)
+    PAIR_FEATURE_ID_BASE = 900000
+    CALENDAR_TIME_FEATURE_ID = 910000
+    SEQ_TIME_FEATURE_ID_BASE = 920000
+    SEQ_TRUNC_FEATURE_ID_BASE = 930000
+    CALENDAR_BUCKET_FEATURE_ID_BASE = 940000
+    SEQ_TIME_BUCKET_FEATURE_ID_BASE = 950000
+    MISSING_FEATURE_ID_BASE = 990000
 
     def __init__(
         self,
@@ -1206,13 +1321,21 @@ class AlignedDenseIntTokenizer(nn.Module):
         d_model: int,
         num_tokens: int = 2,
         emb_skip_threshold: int = 0,
+        use_grouped_raw_dense_proj: bool = False,
+        use_engineered_dense_token: bool = False,
     ) -> None:
         super().__init__()
         self.emb_dim = emb_dim
         self.d_model = d_model
-        self.num_tokens = max(2, int(num_tokens))
-        self.num_aligned_tokens = self.num_tokens - 1
+        if use_grouped_raw_dense_proj and use_engineered_dense_token:
+            raise ValueError(
+                "use_grouped_raw_dense_proj and use_engineered_dense_token "
+                "are mutually exclusive")
+        self.use_engineered_dense_token = use_engineered_dense_token
+        self.num_tokens = max(3 if use_engineered_dense_token else 2, int(num_tokens))
+        self.num_aligned_tokens = self.num_tokens - (2 if use_engineered_dense_token else 1)
         self.emb_skip_threshold = emb_skip_threshold
+        self.use_grouped_raw_dense_proj = use_grouped_raw_dense_proj
 
         int_by_fid = {
             fid: (vs, offset, length)
@@ -1229,10 +1352,50 @@ class AlignedDenseIntTokenizer(nn.Module):
             if fid not in self.ALIGNED_FIDS
         ]
         raw_dim = sum(length for _, length in self.raw_dense_slices)
-        self.raw_dense_proj = nn.Sequential(
-            nn.Linear(max(raw_dim, 1), d_model),
-            nn.LayerNorm(d_model),
-        )
+        self.raw_dense_groups = self._build_raw_dense_groups(user_dense_feature_specs)
+        if self.use_grouped_raw_dense_proj:
+            self.raw_group_order = ['base', 'pair', 'calendar', 'seq_meta', 'missing']
+            self.raw_group_slices = {
+                name: self.raw_dense_groups.get(name, [])
+                for name in self.raw_group_order
+            }
+            self.raw_group_dims = {
+                name: sum(length for _, length in slices)
+                for name, slices in self.raw_group_slices.items()
+            }
+            self.raw_group_projs = nn.ModuleDict({
+                name: nn.Sequential(
+                    nn.Linear(max(self.raw_group_dims[name], 1), d_model),
+                    nn.LayerNorm(d_model),
+                )
+                for name in self.raw_group_order
+            })
+            self.raw_dense_fuse = nn.Sequential(
+                nn.Linear(len(self.raw_group_order) * d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+        elif self.use_engineered_dense_token:
+            self.raw_base_slices = self.raw_dense_groups.get('base', [])
+            self.engineered_dense_slices = []
+            for name in ('pair', 'calendar', 'seq_meta', 'missing'):
+                self.engineered_dense_slices.extend(self.raw_dense_groups.get(name, []))
+            self.raw_base_dim = sum(length for _, length in self.raw_base_slices)
+            self.engineered_dense_dim = sum(
+                length for _, length in self.engineered_dense_slices
+            )
+            self.raw_base_proj = nn.Sequential(
+                nn.Linear(max(self.raw_base_dim, 1), d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.engineered_dense_proj = nn.Sequential(
+                nn.Linear(max(self.engineered_dense_dim, 1), d_model),
+                nn.LayerNorm(d_model),
+            )
+        else:
+            self.raw_dense_proj = nn.Sequential(
+                nn.Linear(max(raw_dim, 1), d_model),
+                nn.LayerNorm(d_model),
+            )
         self.raw_dim = raw_dim
 
         self.aligned_specs: List[Tuple[int, int, int, int, int, int]] = []
@@ -1278,12 +1441,62 @@ class AlignedDenseIntTokenizer(nn.Module):
 
         logging.info(
             "AlignedDenseIntTokenizer: tokens=%d, raw_dim=%d, "
+            "grouped_raw=%s, engineered_dense_token=%s, raw_group_dims=%s, "
+            "raw_base_dim=%s, engineered_dense_dim=%s, "
             "aligned_fids=%s, active_embeddings=%d",
             self.num_tokens,
             raw_dim,
+            self.use_grouped_raw_dense_proj,
+            self.use_engineered_dense_token,
+            getattr(self, 'raw_group_dims', None),
+            getattr(self, 'raw_base_dim', None),
+            getattr(self, 'engineered_dense_dim', None),
             [fid for fid, *_ in self.aligned_specs],
             len(self.embs),
         )
+
+    def _raw_dense_group_name(self, fid: int) -> str:
+        if fid in self.ALIGNED_FIDS:
+            return 'aligned'
+        if self.PAIR_FEATURE_ID_BASE <= fid < self.CALENDAR_TIME_FEATURE_ID:
+            return 'pair'
+        if fid == self.CALENDAR_TIME_FEATURE_ID:
+            return 'calendar'
+        if self.SEQ_TIME_FEATURE_ID_BASE <= fid < self.CALENDAR_BUCKET_FEATURE_ID_BASE:
+            return 'seq_meta'
+        if fid >= self.MISSING_FEATURE_ID_BASE:
+            return 'missing'
+        return 'base'
+
+    def _build_raw_dense_groups(
+        self,
+        user_dense_feature_specs: List[Tuple[int, int, int]],
+    ) -> Dict[str, List[Tuple[int, int]]]:
+        groups: Dict[str, List[Tuple[int, int]]] = {
+            'base': [],
+            'pair': [],
+            'calendar': [],
+            'seq_meta': [],
+            'missing': [],
+        }
+        for fid, offset, length in user_dense_feature_specs:
+            name = self._raw_dense_group_name(fid)
+            if name in groups:
+                groups[name].append((offset, length))
+        return groups
+
+    def _collect_dense_slices(
+        self,
+        user_dense_feats: torch.Tensor,
+        slices: List[Tuple[int, int]],
+    ) -> torch.Tensor:
+        B = user_dense_feats.shape[0]
+        if not slices:
+            return user_dense_feats.new_zeros(B, 1)
+        return torch.cat([
+            user_dense_feats[:, offset:offset + length]
+            for offset, length in slices
+        ], dim=-1)
 
     def forward(
         self,
@@ -1291,15 +1504,35 @@ class AlignedDenseIntTokenizer(nn.Module):
         user_dense_feats: torch.Tensor,
     ) -> torch.Tensor:
         B = user_dense_feats.shape[0]
-        raw_parts = [
-            user_dense_feats[:, offset:offset + length]
-            for offset, length in self.raw_dense_slices
-        ]
-        if raw_parts:
-            raw_dense = torch.cat(raw_parts, dim=-1)
+        if self.use_grouped_raw_dense_proj:
+            raw_group_tokens = []
+            for name in self.raw_group_order:
+                raw_group = self._collect_dense_slices(
+                    user_dense_feats,
+                    self.raw_group_slices[name],
+                )
+                raw_group_tokens.append(F.silu(self.raw_group_projs[name](raw_group)))
+            raw_dense = torch.cat(raw_group_tokens, dim=-1)
+            raw_token = F.silu(self.raw_dense_fuse(raw_dense)).unsqueeze(1)
+        elif self.use_engineered_dense_token:
+            raw_base_dense = self._collect_dense_slices(
+                user_dense_feats,
+                self.raw_base_slices,
+            )
+            raw_token = F.silu(self.raw_base_proj(raw_base_dense)).unsqueeze(1)
+            engineered_dense = self._collect_dense_slices(
+                user_dense_feats,
+                self.engineered_dense_slices,
+            )
+            engineered_token = F.silu(
+                self.engineered_dense_proj(engineered_dense)
+            ).unsqueeze(1)
         else:
-            raw_dense = user_dense_feats.new_zeros(B, 1)
-        raw_token = F.silu(self.raw_dense_proj(raw_dense)).unsqueeze(1)
+            raw_dense = self._collect_dense_slices(
+                user_dense_feats,
+                self.raw_dense_slices,
+            )
+            raw_token = F.silu(self.raw_dense_proj(raw_dense)).unsqueeze(1)
 
         aligned_embs = []
         for local_idx, (_, _, int_offset, dense_offset, length, _) in enumerate(self.aligned_specs):
@@ -1324,6 +1557,8 @@ class AlignedDenseIntTokenizer(nn.Module):
             else:
                 aligned_dense = user_dense_feats.new_zeros(B, self.emb_dim)
             aligned_tokens.append(F.silu(proj(aligned_dense)).unsqueeze(1))
+        if self.use_engineered_dense_token:
+            return torch.cat([raw_token, engineered_token] + aligned_tokens, dim=1)
         return torch.cat([raw_token] + aligned_tokens, dim=1)
 
 
@@ -1372,6 +1607,10 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         use_aligned_dense_int: bool = False,
         aligned_dense_int_tokens: int = 2,
+        use_grouped_raw_dense_proj: bool = False,
+        use_engineered_dense_token: bool = False,
+        use_time_context_gate: bool = False,
+        use_target_din: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1390,6 +1629,10 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_aligned_dense_int = use_aligned_dense_int
         self.aligned_dense_int_tokens = max(2, int(aligned_dense_int_tokens))
+        self.use_grouped_raw_dense_proj = use_grouped_raw_dense_proj
+        self.use_engineered_dense_token = use_engineered_dense_token
+        self.use_time_context_gate = use_time_context_gate and user_dense_dim > 0
+        self.use_target_din = use_target_din
 
         # ================== NS Tokens Construction ==================
 
@@ -1457,6 +1700,8 @@ class PCVRHyFormer(nn.Module):
                     d_model=d_model,
                     num_tokens=self.aligned_dense_int_tokens,
                     emb_skip_threshold=emb_skip_threshold,
+                    use_grouped_raw_dense_proj=use_grouped_raw_dense_proj,
+                    use_engineered_dense_token=use_engineered_dense_token,
                 )
                 num_user_dense_ns = self.user_dense_proj.num_tokens
             else:
@@ -1589,6 +1834,27 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
                 nn.SiLU(),
                 nn.Dropout(dropout_rate),
+            )
+
+        if self.use_time_context_gate:
+            self.time_context_proj = nn.Sequential(
+                nn.Linear(user_dense_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+            )
+            self.time_context_gate = nn.Linear(d_model * 2, d_model)
+            self.time_context_residual = nn.Linear(d_model, d_model)
+            nn.init.zeros_(self.time_context_gate.weight)
+            nn.init.constant_(self.time_context_gate.bias, -1.0)
+            nn.init.normal_(self.time_context_residual.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.time_context_residual.bias)
+
+        if self.use_target_din:
+            self.target_din = TargetDINAttention(
+                d_model=d_model,
+                num_sequences=self.num_sequences,
+                dropout=dropout_rate,
             )
 
         # Dropout
@@ -1834,6 +2100,37 @@ class PCVRHyFormer(nn.Module):
         ns_output = self.ns_output_norm(ns_tokens.mean(dim=1))
         return self.output_fusion(torch.cat([q_output, ns_output], dim=-1))
 
+    def _apply_time_context_gate(
+        self,
+        output: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Let engineered dense/time features add a small gated residual."""
+        if not self.use_time_context_gate:
+            return output
+
+        context = self.time_context_proj(user_dense_feats)
+        gate = torch.sigmoid(self.time_context_gate(
+            torch.cat([output, context], dim=-1)))
+        residual = self.time_context_residual(context)
+        return output + gate * residual
+
+    def _apply_target_din(
+        self,
+        output: torch.Tensor,
+        item_ns: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+    ) -> torch.Tensor:
+        if not self.use_target_din:
+            return output
+        return self.target_din(
+            output=output,
+            item_ns=item_ns,
+            seq_tokens_list=seq_tokens_list,
+            seq_padding_masks=seq_masks_list,
+        )
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1876,6 +2173,9 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
         output = self._fuse_output_with_ns(q_output, final_ns)
+        output = self._apply_time_context_gate(output, inputs.user_dense_feats)
+        output = self._apply_target_din(
+            output, item_ns, seq_tokens_list, seq_masks_list)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1920,6 +2220,9 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=False
         )
         output = self._fuse_output_with_ns(q_output, final_ns)
+        output = self._apply_time_context_gate(output, inputs.user_dense_feats)
+        output = self._apply_target_din(
+            output, item_ns, seq_tokens_list, seq_masks_list)
 
         logits = self.clsfier(output)
         return logits, output

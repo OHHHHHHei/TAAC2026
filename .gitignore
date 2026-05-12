@@ -9,6 +9,9 @@ logs/
 runs/
 tf_events/
 events.out.tfevents*
+taiji-output/
+papers/
+tmp/
 
 # Platform / editor noise
 .DS_Store

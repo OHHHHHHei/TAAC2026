@@ -5,16 +5,26 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --d_model 80 \
-    --user_ns_tokens 5 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --use_ns_output_fusion \
     --use_pair_features \
+    --use_calendar_time_features \
+    --use_calendar_bucket_features \
+    --use_seq_time_features \
+    --use_seq_trunc_features \
+    --use_missing_indicator_features \
     --use_aligned_dense_int \
-    --aligned_dense_int_tokens 5 \
+    --aligned_dense_int_tokens 2 \
+    --use_target_din \
+    --dropout_rate 0.05 \
+    --loss_type bce_focal_blend \
+    --focal_alpha 0.5 \
+    --focal_gamma 1.0 \
+    --focal_blend_weight 0.3 \
     --seq_encoder_type longer \
     --seq_top_k 64 \
     --seq_max_lens seq_a:256,seq_b:256,seq_c:1024,seq_d:1024 \
