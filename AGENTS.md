@@ -138,6 +138,9 @@ Observed validation-curve screenshots:
 
 - `.gitignore` excludes local data/cache/output artifacts such as
   `demo_1000.parquet`, `__pycache__/`, logs, checkpoints, and event files.
+- When a change modifies model/data/training logic, create a git anchor commit
+  so the exploration path can be reconstructed. Pure `run.sh` parameter trials
+  may be tracked in `eval_scores.csv` without a new code commit.
 - Verification commands used for the current structural train/eval changes:
 
 ```bash
