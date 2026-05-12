@@ -1304,6 +1304,9 @@ class AlignedDenseIntTokenizer(nn.Module):
     """
 
     ALIGNED_FIDS = (62, 63, 64, 65, 66, 89, 90, 91)
+    SPECIAL_DENSE_FIDS = (61, 87)
+    UE87_NUM_CHUNKS = 10
+    UE87_CHUNK_DIM = 32
     PAIR_FEATURE_ID_BASE = 900000
     CALENDAR_TIME_FEATURE_ID = 910000
     SEQ_TIME_FEATURE_ID_BASE = 920000
@@ -1349,7 +1352,7 @@ class AlignedDenseIntTokenizer(nn.Module):
         self.raw_dense_slices = [
             (offset, length)
             for fid, offset, length in user_dense_feature_specs
-            if fid not in self.ALIGNED_FIDS
+            if fid not in self.ALIGNED_FIDS and fid not in self.SPECIAL_DENSE_FIDS
         ]
         raw_dim = sum(length for _, length in self.raw_dense_slices)
         self.raw_dense_groups = self._build_raw_dense_groups(user_dense_feature_specs)
@@ -1398,6 +1401,41 @@ class AlignedDenseIntTokenizer(nn.Module):
             )
         self.raw_dim = raw_dim
 
+        dense_by_fid = {
+            fid: (offset, length)
+            for fid, offset, length in user_dense_feature_specs
+        }
+        self.special_dense_specs = {
+            fid: dense_by_fid[fid]
+            for fid in self.SPECIAL_DENSE_FIDS
+            if fid in dense_by_fid
+        }
+        self.use_special_dense_fuse = bool(self.special_dense_specs)
+        if 61 in self.special_dense_specs:
+            _, length = self.special_dense_specs[61]
+            self.ue61_proj = nn.Sequential(
+                nn.Linear(max(length, 1), d_model),
+                nn.LayerNorm(d_model),
+            )
+        if 87 in self.special_dense_specs:
+            _, length = self.special_dense_specs[87]
+            if length == self.UE87_NUM_CHUNKS * self.UE87_CHUNK_DIM:
+                self.ue87_chunk_proj = nn.Linear(self.UE87_CHUNK_DIM, d_model)
+                self.ue87_chunk_norm = nn.LayerNorm(d_model)
+                self.ue87_chunk_score = nn.Linear(d_model, 1)
+                self.ue87_out_norm = nn.LayerNorm(d_model)
+            else:
+                self.ue87_proj = nn.Sequential(
+                    nn.Linear(max(length, 1), d_model),
+                    nn.LayerNorm(d_model),
+                )
+        if self.use_special_dense_fuse:
+            fuse_inputs = 1 + len(self.special_dense_specs)
+            self.special_dense_fuse = nn.Sequential(
+                nn.Linear(fuse_inputs * d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+
         self.aligned_specs: List[Tuple[int, int, int, int, int, int]] = []
         embs = []
         for fid in self.ALIGNED_FIDS:
@@ -1443,7 +1481,7 @@ class AlignedDenseIntTokenizer(nn.Module):
             "AlignedDenseIntTokenizer: tokens=%d, raw_dim=%d, "
             "grouped_raw=%s, engineered_dense_token=%s, raw_group_dims=%s, "
             "raw_base_dim=%s, engineered_dense_dim=%s, "
-            "aligned_fids=%s, active_embeddings=%d",
+            "special_dense=%s, aligned_fids=%s, active_embeddings=%d",
             self.num_tokens,
             raw_dim,
             self.use_grouped_raw_dense_proj,
@@ -1451,6 +1489,7 @@ class AlignedDenseIntTokenizer(nn.Module):
             getattr(self, 'raw_group_dims', None),
             getattr(self, 'raw_base_dim', None),
             getattr(self, 'engineered_dense_dim', None),
+            self.special_dense_specs,
             [fid for fid, *_ in self.aligned_specs],
             len(self.embs),
         )
@@ -1458,6 +1497,8 @@ class AlignedDenseIntTokenizer(nn.Module):
     def _raw_dense_group_name(self, fid: int) -> str:
         if fid in self.ALIGNED_FIDS:
             return 'aligned'
+        if fid in self.SPECIAL_DENSE_FIDS:
+            return 'special_dense'
         if self.PAIR_FEATURE_ID_BASE <= fid < self.CALENDAR_TIME_FEATURE_ID:
             return 'pair'
         if fid == self.CALENDAR_TIME_FEATURE_ID:
@@ -1498,6 +1539,41 @@ class AlignedDenseIntTokenizer(nn.Module):
             for offset, length in slices
         ], dim=-1)
 
+    def _apply_special_dense_fuse(
+        self,
+        raw_token: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.use_special_dense_fuse:
+            return raw_token
+
+        tokens = [raw_token.squeeze(1)]
+        if 61 in self.special_dense_specs:
+            offset, length = self.special_dense_specs[61]
+            ue61 = user_dense_feats[:, offset:offset + length]
+            tokens.append(F.silu(self.ue61_proj(ue61)))
+        if 87 in self.special_dense_specs:
+            offset, length = self.special_dense_specs[87]
+            ue87 = user_dense_feats[:, offset:offset + length]
+            if hasattr(self, 'ue87_chunk_proj'):
+                chunks = ue87.reshape(
+                    ue87.shape[0],
+                    self.UE87_NUM_CHUNKS,
+                    self.UE87_CHUNK_DIM,
+                )
+                chunk_tokens = F.silu(self.ue87_chunk_proj(chunks))
+                chunk_tokens = self.ue87_chunk_norm(chunk_tokens)
+                weights = torch.softmax(
+                    self.ue87_chunk_score(chunk_tokens).squeeze(-1),
+                    dim=-1,
+                )
+                ue87_token = (chunk_tokens * weights.unsqueeze(-1)).sum(dim=1)
+                tokens.append(F.silu(self.ue87_out_norm(ue87_token)))
+            else:
+                tokens.append(F.silu(self.ue87_proj(ue87)))
+
+        return F.silu(self.special_dense_fuse(torch.cat(tokens, dim=-1))).unsqueeze(1)
+
     def forward(
         self,
         user_int_feats: torch.Tensor,
@@ -1533,6 +1609,7 @@ class AlignedDenseIntTokenizer(nn.Module):
                 self.raw_dense_slices,
             )
             raw_token = F.silu(self.raw_dense_proj(raw_dense)).unsqueeze(1)
+        raw_token = self._apply_special_dense_fuse(raw_token, user_dense_feats)
 
         aligned_embs = []
         for local_idx, (_, _, int_offset, dense_offset, length, _) in enumerate(self.aligned_specs):
