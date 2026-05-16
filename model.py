@@ -16,6 +16,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_domain_calendar_buckets: dict  # {domain: tensor [B, L]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1672,6 +1673,7 @@ class PCVRHyFormer(nn.Module):
         seq_causal: bool = False,
         action_num: int = 1,
         num_time_buckets: int = 65,
+        num_seq_domain_calendar_buckets: int = 0,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1698,6 +1700,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
+        self.num_seq_domain_calendar_buckets = num_seq_domain_calendar_buckets
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1863,6 +1866,9 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+        if num_seq_domain_calendar_buckets > 0:
+            self.seq_domain_calendar_embedding = nn.Embedding(
+                num_seq_domain_calendar_buckets, d_model, padding_idx=0)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1986,6 +1992,9 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+        if self.num_seq_domain_calendar_buckets > 0:
+            nn.init.xavier_normal_(self.seq_domain_calendar_embedding.weight.data)
+            self.seq_domain_calendar_embedding.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -2057,6 +2066,8 @@ class PCVRHyFormer(nn.Module):
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
             skip_count += 1
+        if self.num_seq_domain_calendar_buckets > 0:
+            skip_count += 1
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -2083,6 +2094,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        domain_calendar_bucket_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -2104,6 +2116,9 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+        if self.num_seq_domain_calendar_buckets > 0:
+            token_emb = token_emb + self.seq_domain_calendar_embedding(
+                domain_calendar_bucket_ids)
 
         return token_emb
 
@@ -2236,7 +2251,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_domain_calendar_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2285,7 +2301,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_domain_calendar_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

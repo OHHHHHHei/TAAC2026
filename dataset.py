@@ -187,6 +187,7 @@ BUCKET_BOUNDARIES = np.array([
 # That is why ``train.py`` / ``infer.py`` only expose the boolean flag
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+NUM_SEQ_DOMAIN_CALENDAR_BUCKETS = 4 * 7 * 24 + 1
 
 # High-confidence item-history intersections observed on the demo parquet. Each
 # spec creates five dense features: hit_any, hit_count_norm, hit_recency_score,
@@ -316,6 +317,7 @@ class PCVRParquetDataset(IterableDataset):
         use_calendar_time_features: bool = False,
         use_calendar_bucket_features: bool = False,
         use_seq_time_bucket_features: bool = False,
+        use_seq_domain_calendar_features: bool = False,
         use_seq_time_features: bool = False,
         use_seq_trunc_features: bool = False,
         use_missing_indicator_features: bool = False,
@@ -352,6 +354,8 @@ class PCVRParquetDataset(IterableDataset):
                 ``user_int_feats``.
             use_seq_time_bucket_features: append low-cardinality per-domain
                 sequence time summary buckets to ``user_int_feats``.
+            use_seq_domain_calendar_features: append per-event domain-aware
+                weekday-hour bucket ids to sequence tokens.
             use_seq_time_features: append per-domain sequence timestamp
                 summary features to ``user_dense_feats``.
             use_seq_trunc_features: append per-domain raw length and truncation
@@ -388,6 +392,7 @@ class PCVRParquetDataset(IterableDataset):
         self.use_calendar_time_features = use_calendar_time_features
         self.use_calendar_bucket_features = use_calendar_bucket_features
         self.use_seq_time_bucket_features = use_seq_time_bucket_features
+        self.use_seq_domain_calendar_features = use_seq_domain_calendar_features
         self.use_seq_time_features = use_seq_time_features
         self.use_seq_trunc_features = use_seq_trunc_features
         self.use_missing_indicator_features = use_missing_indicator_features
@@ -433,13 +438,15 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_dom_cal = {}
         self._buf_seq_ts = {}
         self._buf_seq_lens = {}
-        for domain in self.seq_domains:
+        for domain_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_dom_cal[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_ts[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
@@ -1721,6 +1728,8 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            domain_calendar_bucket = self._buf_seq_dom_cal[domain][:B]
+            domain_calendar_bucket[:] = 0
             ts_padded = self._buf_seq_ts[domain][:B]
             ts_padded[:] = 0
             full_min_ts = np.zeros(B, dtype=np.int64)
@@ -1770,7 +1779,25 @@ class PCVRParquetDataset(IterableDataset):
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
 
+                if self.use_seq_domain_calendar_features:
+                    valid_ts = ts_padded > 0
+                    local_ts = ts_padded + LOCAL_TIME_OFFSET_SECONDS
+                    local_day = local_ts // 86400
+                    hour = (local_ts % 86400) // 3600
+                    # 1970-01-01 was Thursday; +3 maps Monday to 0.
+                    weekday = (local_day + 3) % 7
+                    cal_bucket = (
+                        domain_idx * 7 * 24
+                        + weekday * 24
+                        + hour
+                        + 1
+                    )
+                    cal_bucket[~valid_ts] = 0
+                    domain_calendar_bucket[:] = cal_bucket
+
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_domain_calendar_bucket'] = torch.from_numpy(
+                domain_calendar_bucket.copy())
             seq_values[domain] = out
             seq_timestamps[domain] = ts_padded
             seq_lengths[domain] = lengths
@@ -1840,6 +1867,7 @@ def get_pcvr_data(
     use_calendar_time_features: bool = False,
     use_calendar_bucket_features: bool = False,
     use_seq_time_bucket_features: bool = False,
+    use_seq_domain_calendar_features: bool = False,
     use_seq_time_features: bool = False,
     use_seq_trunc_features: bool = False,
     use_missing_indicator_features: bool = False,
@@ -1918,6 +1946,7 @@ def get_pcvr_data(
         use_calendar_time_features=use_calendar_time_features,
         use_calendar_bucket_features=use_calendar_bucket_features,
         use_seq_time_bucket_features=use_seq_time_bucket_features,
+        use_seq_domain_calendar_features=use_seq_domain_calendar_features,
         use_seq_time_features=use_seq_time_features,
         use_seq_trunc_features=use_seq_trunc_features,
         use_missing_indicator_features=use_missing_indicator_features,
@@ -1950,6 +1979,7 @@ def get_pcvr_data(
         use_calendar_time_features=use_calendar_time_features,
         use_calendar_bucket_features=use_calendar_bucket_features,
         use_seq_time_bucket_features=use_seq_time_bucket_features,
+        use_seq_domain_calendar_features=use_seq_domain_calendar_features,
         use_seq_time_features=use_seq_time_features,
         use_seq_trunc_features=use_seq_trunc_features,
         use_missing_indicator_features=use_missing_indicator_features,

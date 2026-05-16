@@ -19,7 +19,12 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    get_pcvr_data,
+    NUM_SEQ_DOMAIN_CALENDAR_BUCKETS,
+    NUM_TIME_BUCKETS,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -117,6 +122,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_seq_time_bucket_features', action='store_true', default=False,
                         help='Append low-cardinality per-domain sequence time '
                              'summary buckets to user int feats')
+    parser.add_argument('--use_seq_domain_calendar_features', action='store_true', default=False,
+                        help='Add domain-aware event-level weekday-hour calendar '
+                             'embeddings to sequence tokens')
     parser.add_argument('--use_seq_time_features', action='store_true', default=False,
                         help='Append per-domain sequence timestamp summary features '
                              'to user dense feats')
@@ -350,6 +358,7 @@ def main() -> None:
         use_calendar_time_features=args.use_calendar_time_features,
         use_calendar_bucket_features=args.use_calendar_bucket_features,
         use_seq_time_bucket_features=args.use_seq_time_bucket_features,
+        use_seq_domain_calendar_features=args.use_seq_domain_calendar_features,
         use_seq_time_features=args.use_seq_time_features,
         use_seq_trunc_features=args.use_seq_trunc_features,
         use_missing_indicator_features=args.use_missing_indicator_features,
@@ -401,6 +410,10 @@ def main() -> None:
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "num_seq_domain_calendar_buckets": (
+            NUM_SEQ_DOMAIN_CALENDAR_BUCKETS
+            if args.use_seq_domain_calendar_features else 0
+        ),
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,

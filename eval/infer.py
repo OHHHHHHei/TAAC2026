@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    PCVRParquetDataset,
+    NUM_SEQ_DOMAIN_CALENDAR_BUCKETS,
+    NUM_TIME_BUCKETS,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -60,6 +65,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_causal': False,
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
+    'num_seq_domain_calendar_buckets': 0,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -155,6 +161,17 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
                 logging.warning(
                     f"train_config missing both 'num_time_buckets' and 'use_time_buckets', "
                     f"using fallback = {cfg[key]}")
+            continue
+        if key == 'num_seq_domain_calendar_buckets':
+            if 'num_seq_domain_calendar_buckets' in train_config:
+                cfg[key] = train_config['num_seq_domain_calendar_buckets']
+            elif 'use_seq_domain_calendar_features' in train_config:
+                cfg[key] = (
+                    NUM_SEQ_DOMAIN_CALENDAR_BUCKETS
+                    if train_config['use_seq_domain_calendar_features'] else 0
+                )
+            else:
+                cfg[key] = _FALLBACK_MODEL_CFG[key]
             continue
 
         if key in train_config:
@@ -293,12 +310,16 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_domain_calendar_buckets: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
         B, _, L = device_batch[domain].shape
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_domain_calendar_buckets[domain] = device_batch.get(
+            f'{domain}_domain_calendar_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
     return ModelInput(
@@ -309,6 +330,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_domain_calendar_buckets=seq_domain_calendar_buckets,
     )
 
 
@@ -349,6 +371,8 @@ def main() -> None:
         train_config.get('use_calendar_bucket_features', False))
     use_seq_time_bucket_features = bool(
         train_config.get('use_seq_time_bucket_features', False))
+    use_seq_domain_calendar_features = bool(
+        train_config.get('use_seq_domain_calendar_features', False))
     use_seq_time_features = bool(
         train_config.get('use_seq_time_features', False))
     use_seq_trunc_features = bool(
@@ -373,6 +397,7 @@ def main() -> None:
         use_calendar_time_features=use_calendar_time_features,
         use_calendar_bucket_features=use_calendar_bucket_features,
         use_seq_time_bucket_features=use_seq_time_bucket_features,
+        use_seq_domain_calendar_features=use_seq_domain_calendar_features,
         use_seq_time_features=use_seq_time_features,
         use_seq_trunc_features=use_seq_trunc_features,
         use_missing_indicator_features=use_missing_indicator_features,

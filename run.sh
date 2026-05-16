@@ -15,6 +15,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --use_calendar_time_features \
     --use_calendar_bucket_features \
     --use_seq_time_features \
+    --use_seq_domain_calendar_features \
     --use_seq_trunc_features \
     --use_missing_indicator_features \
     --use_aligned_dense_int \
