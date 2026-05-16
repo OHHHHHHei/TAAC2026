@@ -1677,7 +1677,7 @@ class PCVRParquetDataset(IterableDataset):
         seq_lengths: Dict[str, "npt.NDArray[np.int64]"] = {}
         seq_raw_lengths: Dict[str, "npt.NDArray[np.int64]"] = {}
         seq_full_time_stats: Dict[str, Dict[str, "npt.NDArray[np.int64]"]] = {}
-        for domain in self.seq_domains:
+        for domain_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
