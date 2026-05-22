@@ -8,7 +8,7 @@ import os
 import glob
 import shutil
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import sigmoid_focal_loss, EarlyStopping, ModelEMA
 from model import ModelInput
 
 
@@ -56,6 +56,7 @@ class PCVRHyFormerRankingTrainer:
         reinit_cardinality_threshold: int = 0,
         amp: bool = False,
         amp_dtype: str = 'bf16',
+        ema_decay: float = 0.0,
         save_epoch_checkpoints: bool = False,
         ckpt_params: Optional[Dict[str, Any]] = None,
         writer: Optional[Any] = None,
@@ -82,6 +83,7 @@ class PCVRHyFormerRankingTrainer:
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
             dense_params = model.get_dense_params()
+            dense_param_ptrs = {p.data_ptr() for p in dense_params}
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -94,6 +96,7 @@ class PCVRHyFormerRankingTrainer:
             )
         else:
             self.sparse_optimizer = None
+            dense_param_ptrs = {p.data_ptr() for p in model.parameters()}
             self.dense_optimizer = torch.optim.AdamW(
                 model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
@@ -138,6 +141,14 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.save_epoch_checkpoints: bool = save_epoch_checkpoints
+        self.ema_decay: float = float(ema_decay)
+        self.ema: Optional[ModelEMA] = None
+        if self.ema_decay > 0.0:
+            self.ema = ModelEMA(
+                model, decay=self.ema_decay, include_param_ptrs=dense_param_ptrs)
+            logging.info(
+                f"Dense-only EMA enabled: decay={self.ema_decay}, "
+                f"tracked_tensors={len(self.ema)}")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -145,7 +156,20 @@ class PCVRHyFormerRankingTrainer:
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"amp_enabled={self.amp_enabled}, "
                      f"amp_dtype={self.amp_dtype_name}, "
-                     f"save_epoch_checkpoints={self.save_epoch_checkpoints}")
+                     f"save_epoch_checkpoints={self.save_epoch_checkpoints}, "
+                     f"ema_decay={self.ema_decay}")
+
+    @contextmanager
+    def _ema_scope(self):
+        """Temporarily swap dense parameters to their EMA shadow weights."""
+        if self.ema is None:
+            yield
+            return
+        self.ema.apply_shadow(self.model)
+        try:
+            yield
+        finally:
+            self.ema.restore(self.model)
 
     def _build_step_dir_name(
         self,
@@ -240,7 +264,8 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            with self._ema_scope():
+                torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
@@ -309,10 +334,11 @@ class PCVRHyFormerRankingTrainer:
         if not is_likely_new_best:
             # No new best anticipated: leave disk untouched. The previous
             # best_model dir (with its model.pt + sidecars) remains valid.
-            self.early_stopping(val_auc, self.model, {
-                "best_val_AUC": val_auc,
-                "best_val_logloss": val_logloss,
-            })
+            with self._ema_scope():
+                self.early_stopping(val_auc, self.model, {
+                    "best_val_AUC": val_auc,
+                    "best_val_logloss": val_logloss,
+                })
             return
 
         # Point EarlyStopping at the canonical best-model location for this
@@ -328,10 +354,11 @@ class PCVRHyFormerRankingTrainer:
         # I/O needed when a new best is confirmed.
         self._remove_old_best_dirs()
 
-        self.early_stopping(val_auc, self.model, {
-            "best_val_AUC": val_auc,
-            "best_val_logloss": val_logloss,
-        })
+        with self._ema_scope():
+            self.early_stopping(val_auc, self.model, {
+                "best_val_AUC": val_auc,
+                "best_val_logloss": val_logloss,
+            })
 
         # Write sidecar files only when EarlyStopping actually confirmed a
         # new best and wrote model.pt. If the score tripped our heuristic
@@ -520,6 +547,9 @@ class PCVRHyFormerRankingTrainer:
             if self.sparse_optimizer is not None:
                 self.sparse_optimizer.step()
 
+        if self.ema is not None:
+            self.ema.update(self.model)
+
         return loss.item()
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
@@ -529,23 +559,24 @@ class PCVRHyFormerRankingTrainer:
         out before computing both metrics.
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
-        self.model.eval()
         if not epoch:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
+        with self._ema_scope():
+            self.model.eval()
+            pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
 
-        all_logits_list = []
-        all_labels_list = []
+            all_logits_list = []
+            all_labels_list = []
 
-        with torch.no_grad():
-            for step, batch in pbar:
-                logits, labels = self._evaluate_step(batch)
-                all_logits_list.append(logits.detach().cpu())
-                all_labels_list.append(labels.detach().cpu())
+            with torch.no_grad():
+                for step, batch in pbar:
+                    logits, labels = self._evaluate_step(batch)
+                    all_logits_list.append(logits.detach().cpu())
+                    all_labels_list.append(labels.detach().cpu())
 
-        all_logits = torch.cat(all_logits_list, dim=0)
-        all_labels = torch.cat(all_labels_list, dim=0).long()
+            all_logits = torch.cat(all_logits_list, dim=0)
+            all_labels = torch.cat(all_labels_list, dim=0).long()
 
         # Binary AUC via sklearn.
         probs = torch.sigmoid(all_logits).numpy()

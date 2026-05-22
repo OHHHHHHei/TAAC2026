@@ -34,6 +34,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --split_time_stat median \
     --amp \
     --amp_dtype bf16 \
+    --ema_decay 0.999 \
     --save_epoch_checkpoints \
     --num_workers 8 \
     "$@"

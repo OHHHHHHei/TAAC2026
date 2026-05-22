@@ -12,6 +12,9 @@ events.out.tfevents*
 taiji-output/
 papers/
 tmp/
+eval_scores.csv
+agent_workspace/
+数据与模型梳理/
 
 # Platform / editor noise
 .DS_Store

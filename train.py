@@ -77,6 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--amp_dtype', type=str, default='bf16',
                         choices=['bf16', 'fp16'],
                         help='AMP compute dtype when --amp is enabled')
+    parser.add_argument('--ema_decay', type=float, default=0.0,
+                        help='Enable dense-parameter EMA with this decay; '
+                             '0 disables EMA')
     parser.add_argument('--tf32', action='store_true', default=False,
                         help='Enable TF32 matmul/cuDNN kernels on supported NVIDIA GPUs')
     parser.add_argument('--save_epoch_checkpoints', action='store_true', default=False,
@@ -475,6 +478,7 @@ def main() -> None:
         reinit_cardinality_threshold=args.reinit_cardinality_threshold,
         amp=args.amp,
         amp_dtype=args.amp_dtype,
+        ema_decay=args.ema_decay,
         save_epoch_checkpoints=args.save_epoch_checkpoints,
         ckpt_params=ckpt_params,
         writer=writer,

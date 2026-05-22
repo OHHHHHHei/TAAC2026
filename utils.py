@@ -4,7 +4,7 @@ import copy
 import logging
 import time
 from datetime import timedelta
-from typing import Optional, Dict, Any
+from typing import Iterable, Optional, Dict, Any, Set
 
 import numpy as np
 import torch
@@ -231,6 +231,74 @@ class EarlyStopping:
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
         torch.save(model.state_dict(), self.checkpoint_path)
         self.best_saved_score = score
+
+
+class ModelEMA:
+    """Exponential moving average for a selected subset of model parameters.
+
+    The TAAC training recipe uses huge sparse embedding tables that are
+    periodically reinitialized, so EMA is most useful on the dense AdamW path.
+    ``include_param_ptrs`` lets the trainer restrict tracking to those dense
+    parameters while saving an ordinary model ``state_dict`` for evaluation.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.999,
+        include_param_ptrs: Optional[Iterable[int]] = None,
+    ) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
+        self.decay: float = float(decay)
+        self.include_param_ptrs: Optional[Set[int]] = (
+            set(include_param_ptrs) if include_param_ptrs is not None else None
+        )
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        self._init_shadow(model)
+
+    def _should_track(self, name: str, param: nn.Parameter) -> bool:
+        if not param.requires_grad:
+            return False
+        if self.include_param_ptrs is None:
+            return True
+        return param.data_ptr() in self.include_param_ptrs
+
+    @torch.no_grad()
+    def _init_shadow(self, model: nn.Module) -> None:
+        self.shadow.clear()
+        for name, param in model.named_parameters():
+            if self._should_track(name, param):
+                self.shadow[name] = param.detach().clone().float()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name not in self.shadow or not param.requires_grad:
+                continue
+            self.shadow[name].mul_(self.decay).add_(
+                param.detach().float(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module) -> None:
+        self.backup.clear()
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.backup[name] = param.detach().clone()
+            param.data.copy_(self.shadow[name].to(
+                device=param.device, dtype=param.dtype))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup.clear()
+
+    def __len__(self) -> int:
+        return len(self.shadow)
 
 
 def set_seed(seed: int) -> None:
