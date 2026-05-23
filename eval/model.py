@@ -1304,7 +1304,8 @@ class AlignedDenseIntTokenizer(nn.Module):
     sparse id embeddings in fid chunks.
     """
 
-    ALIGNED_FIDS = (62, 63, 64, 65, 66, 89, 90, 91)
+    ALIGNED_FIDS = (62, 63, 64, 65, 66)
+    LOG_WEIGHT_ALIGNED_FIDS = frozenset((62, 63, 64, 65, 66))
     SPECIAL_DENSE_FIDS = (61, 87)
     UE87_NUM_CHUNKS = 10
     UE87_CHUNK_DIM = 32
@@ -1482,7 +1483,8 @@ class AlignedDenseIntTokenizer(nn.Module):
             "AlignedDenseIntTokenizer: tokens=%d, raw_dim=%d, "
             "grouped_raw=%s, engineered_dense_token=%s, raw_group_dims=%s, "
             "raw_base_dim=%s, engineered_dense_dim=%s, "
-            "special_dense=%s, aligned_fids=%s, active_embeddings=%d",
+            "special_dense=%s, aligned_fids=%s, log_weight_fids=%s, "
+            "active_embeddings=%d",
             self.num_tokens,
             raw_dim,
             self.use_grouped_raw_dense_proj,
@@ -1492,6 +1494,10 @@ class AlignedDenseIntTokenizer(nn.Module):
             getattr(self, 'engineered_dense_dim', None),
             self.special_dense_specs,
             [fid for fid, *_ in self.aligned_specs],
+            [
+                fid for fid, *_ in self.aligned_specs
+                if fid in self.LOG_WEIGHT_ALIGNED_FIDS
+            ],
             len(self.embs),
         )
 
@@ -1613,7 +1619,7 @@ class AlignedDenseIntTokenizer(nn.Module):
         raw_token = self._apply_special_dense_fuse(raw_token, user_dense_feats)
 
         aligned_embs = []
-        for local_idx, (_, _, int_offset, dense_offset, length, _) in enumerate(self.aligned_specs):
+        for local_idx, (fid, _, int_offset, dense_offset, length, _) in enumerate(self.aligned_specs):
             real_idx = self._emb_index[local_idx]
             if real_idx == -1:
                 fid_emb = user_dense_feats.new_zeros(B, self.emb_dim)
@@ -1621,6 +1627,8 @@ class AlignedDenseIntTokenizer(nn.Module):
                 vals = user_int_feats[:, int_offset:int_offset + length].long()
                 weights = user_dense_feats[:, dense_offset:dense_offset + length].to(torch.float32)
                 weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+                if fid in self.LOG_WEIGHT_ALIGNED_FIDS:
+                    weights = torch.log1p(weights.clamp_min(0.0))
                 mask = (vals != 0).to(weights.dtype)
                 weights = weights * mask
                 emb_all = self.embs[real_idx](vals)
