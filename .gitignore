@@ -15,6 +15,10 @@ tmp/
 eval_scores.csv
 agent_workspace/
 数据与模型梳理/
+score_progression.md
+figures/*
+!figures/score_progression_curve.png
+scripts/plot_score_progression.py
 
 # Platform / editor noise
 .DS_Store
