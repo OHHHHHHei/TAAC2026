@@ -13,21 +13,26 @@ the full competition training dataset.
 
 ## Current Repository State
 
-The local git baseline is:
+The git tree has been reorganized for post-competition review:
 
-- `main`: initial platform-style baseline, commit `412a747`.
-- `exp/output-ns-fusion`: NS output fusion experiment, commit `d90cd0d`.
-- `exp/ns-fusion-time-split`: NS fusion plus timestamp Row Group split,
-  commit `17ffdd5`.
-- `exp/time-split-amp-bf16`: time split plus AMP BF16 training base, commit
-  `4c6070e`.
-- `exp/longer-epoch-checkpoints`: active longer-sequence experiment branch;
-  includes time split, AMP BF16, per-epoch checkpoint snapshots, and
-  `seq_top_k=128`, commit `450530f`.
-- `exp/item-id-hash`: branch with hashed target `item_id` support, commits
-  `24e3dcb` and `778999e`.
-- `exp/ns-fusion-amp-bf16`: historical AMP BF16-only branch, commit `0db57c8`.
-- `eval_scores.csv`: local CSV file used to record platform eval results.
+- `baseline/original`: original platform-style baseline, commit `412a747`.
+- `baseline-original`: lightweight tag pointing to the same original baseline.
+- `main`: current best validated mainline, commit `8d142e2`.
+- `codex/log-pair-6266-v1`: historical branch for the best experiment line,
+  also at `8d142e2`.
+- `codex/*` and `exp/*`: side experiment branches. Branches that did not beat
+  the current mainline remain as side branches and should not be merged into
+  `main` unless their platform eval result is later confirmed to improve the
+  best score.
+- `eval_scores.csv`: local CSV file used to record platform eval results. It is
+  intentionally ignored by git.
+
+The intended workflow is:
+
+1. Keep `main` as the best confirmed solution line.
+2. Start each new experiment from `main`.
+3. Merge back only experiments with confirmed platform AUC improvement.
+4. Keep failed or ambiguous experiments as side branches for review.
 
 Sparse embedding restart behavior in the current code:
 
@@ -85,24 +90,30 @@ Sparse embedding restart behavior in the current code:
 - `ns_groups.json`: example semantic grouping for NS tokens. Current active
   `run.sh` disables it with `--ns_groups_json ""`.
 
-## Current Baseline Configuration
+## Current Best Configuration
 
-Active `run.sh` baseline uses:
+Active `run.sh` on `main` uses:
 
-- `--ns_tokenizer_type rankmixer`
-- `--user_ns_tokens 5`
-- `--item_ns_tokens 2`
-- `--num_queries 2`
-- `--ns_groups_json ""`
-- `--emb_skip_threshold 1000000`
-- `--num_workers 8`
+- RankMixer NS tokenizer with `--ns_groups_json ""`.
+- `--user_ns_tokens 4`, `--item_ns_tokens 2`, `--num_queries 2`.
+- Longer sequence encoder with `--seq_top_k 64`.
+- `--seq_max_lens seq_a:256,seq_b:256,seq_c:1024,seq_d:1024`.
+- Row-group time split by `timestamp` median.
+- AMP BF16.
+- Dense-only EMA with `--ema_decay 0.999`.
+- Per-epoch checkpoint snapshots.
+- BCE + focal blend loss.
+- Target DIN.
+- Calendar/time, sequence-time, sequence-truncation, missing-indicator, pair,
+  and aligned dense-int features.
 
-On `exp/item-id-hash`, `run.sh` additionally enables:
+The best confirmed online result is:
 
-- `--item_id_hash_bins 1000000`
-
-The item-id hash branch adds target `item_id` to both train and eval batches and
-injects it into the first item NS token through a hashed embedding table.
+- AUC `0.831588`
+- Eval job `129141`
+- Eval name `修改62-66pair epoch5_eval_1779544640`
+- Code anchor `ad88c74` for the core model/data change
+- Current documented mainline `8d142e2`
 
 ## Observed Platform Results
 

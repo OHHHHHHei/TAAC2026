@@ -12,6 +12,7 @@ events.out.tfevents*
 taiji-output/
 papers/
 tmp/
+outputs/
 eval_scores.csv
 agent_workspace/
 数据与模型梳理/
@@ -23,5 +24,7 @@ scripts/plot_score_progression.py
 
 # Platform / editor noise
 .DS_Store
+.claude/
+.ruff_cache/
 .idea/
 .vscode/
