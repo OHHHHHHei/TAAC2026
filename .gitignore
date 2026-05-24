@@ -17,6 +17,7 @@ agent_workspace/
 数据与模型梳理/
 score_progression.md
 figures/*
+!figures/team_performance.png
 !figures/score_progression_curve.png
 scripts/plot_score_progression.py
 

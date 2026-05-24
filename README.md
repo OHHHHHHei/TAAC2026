@@ -12,6 +12,8 @@
 AUC: 0.831588
 ```
 
+![TAAC2026 Academic Track Team Performance](figures/final_rank.png)
+
 ## 涨分曲线
 
 ![TAAC2026 PCVR 线上 AUC 涨分曲线](figures/score_progression_curve.png)
